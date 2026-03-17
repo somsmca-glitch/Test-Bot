@@ -139,7 +139,7 @@ def get_nifty50_symbols() -> list:
 
 
 def get_smallcap_symbols() -> list:
-    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap",, limit=25)
+    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap", limit=25)
 
 
 def get_midcap_symbols() -> list:
