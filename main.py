@@ -139,11 +139,11 @@ def get_nifty50_symbols() -> list:
 
 
 def get_smallcap_symbols() -> list:
-    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap")
+    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap",, limit=25)
 
 
 def get_midcap_symbols() -> list:
-    return fetch_index_symbols("NIFTY%20MIDCAP%20100", "midcap")
+    return fetch_index_symbols("NIFTY%20MIDCAP%20100", "midcap", limit=25)
 
 
 # ─── LIVE NSE MARKET DATA ────────────────────────────────────────────────────
