@@ -13,18 +13,29 @@ Run:
   python indian_stock_screener_bot.py
 """
 
+from __future__ import annotations
+
 import os
 import logging
 import asyncio
+import csv
+import heapq
 import requests
 import pandas as pd
 import yfinance as yf
 import ta
+import time
+from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from io import StringIO
 import gc
-import heapq
+from threading import Lock
+from collections import OrderedDict
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -32,7 +43,6 @@ from telegram.ext import (
 )
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "6039703460:AAFOJDkr5BT5ffhIQ2UCiVuWeZXnHxG2W4M")
@@ -46,9 +56,10 @@ UNIVERSE_LABELS = {
 }
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "100") or "100")
-# Keep results bounded to avoid time/memory blowups.
-RESULT_LIMIT = 5
+RESULT_LIMIT = int(os.getenv("RESULT_LIMIT", "5") or "5")
 YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "50") or "50")
+HEAVY_CONCURRENCY = int(os.getenv("HEAVY_CONCURRENCY", "1") or "1")
+HEAVY_WORK_SEM = asyncio.Semaphore(max(1, HEAVY_CONCURRENCY))
 
 
 def price_ok(price) -> bool:
@@ -73,28 +84,55 @@ NSE_HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-# Simple in-memory cache: {key: (data, fetched_at)}
-_CACHE: dict = {}
-CACHE_TTL = 600  # 10 minutes
+# Simple in-memory LRU cache: {key: (data, fetched_at_monotonic)}
+_CACHE: "OrderedDict[str, tuple[object, float]]" = OrderedDict()
+_CACHE_LOCK = Lock()
+CACHE_TTL = 600  # seconds
+CACHE_MAX = int(os.getenv("CACHE_MAX", "2048") or "2048")
 
 
 def cache_get(key: str, ttl_seconds: int = CACHE_TTL):
-    entry = _CACHE.get(key)
-    if entry and (datetime.now() - entry[1]).seconds < ttl_seconds:
-        return entry[0]
-    return None
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if not entry:
+            return None
+        value, fetched_at = entry
+        if ttl_seconds > 0 and (now - fetched_at) >= ttl_seconds:
+            _CACHE.pop(key, None)
+            return None
+        _CACHE.move_to_end(key)
+        return value
 
 
 def cache_set(key: str, value):
-    _CACHE[key] = (value, datetime.now())
+    with _CACHE_LOCK:
+        _CACHE[key] = (value, time.monotonic())
+        _CACHE.move_to_end(key)
+        if CACHE_MAX > 0:
+            while len(_CACHE) > CACHE_MAX:
+                _CACHE.popitem(last=False)
+
+
+@contextmanager
+def log_timing(label: str):
+    if os.getenv("PROFILE_TIMINGS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("[timing] %s: %.3fs", label, time.perf_counter() - t0)
 
 
 # ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 
 HOME_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📊 Technical"), KeyboardButton("📈 Fundamental")],
-        [KeyboardButton("📉 Top Losers"), KeyboardButton("🚀 Top Gainers"),KeyboardButton("🚀 Active Val"), KeyboardButton("🚀 Active Vol")],
+        [KeyboardButton("📊 Technical"), KeyboardButton("📈 Fundamental"), KeyboardButton("📌 OI Data")],
+        [KeyboardButton("📉 Top 5 Losers"), KeyboardButton("🚀 Top 5 Gainers")],
+        [KeyboardButton("🚀 Active Value"), KeyboardButton("🚀 Active Vol")],
     ],
     resize_keyboard=True,
 )
@@ -102,17 +140,24 @@ HOME_KEYBOARD = ReplyKeyboardMarkup(
 TECHNICAL_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🧺 Nifty 50"), KeyboardButton("🌐 All Stocks")],
-        [KeyboardButton("📉 10 SMA"), KeyboardButton("📈 100 SMA")],
+        [KeyboardButton("📉 10 SMA"), KeyboardButton("📈 Prev Week High")],
         [KeyboardButton("🔵 RSI Oversold"), KeyboardButton("🔴 RSI Overbought")],
-       
-        [KeyboardButton("🏠 Home")],
+        [KeyboardButton("📌 OI Data"), KeyboardButton("🏠 Home")],
     ],
     resize_keyboard=True,
 )
 
 FUNDAMENTAL_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("🔹 Small Cap"), KeyboardButton("🔷 Mid Cap")],
+        [KeyboardButton("🔹 Small Cap"), KeyboardButton("🔷 Mid Cap"),KeyboardButton("📄 Stock Info")],
+        [KeyboardButton("📌 OI Data"), KeyboardButton("🏠 Home")],
+    ],
+    resize_keyboard=True,
+)
+
+OI_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📌 Top CE OI"), KeyboardButton("📌 Top PE OI")],
         [KeyboardButton("🏠 Home")],
     ],
     resize_keyboard=True,
@@ -123,13 +168,106 @@ FUNDAMENTAL_KEYBOARD = ReplyKeyboardMarkup(
 
 def nse_session() -> requests.Session:
     """Return a cookie-primed NSE session."""
+    global _NSE_SESSION, _NSE_SESSION_PRIMED_AT
+    now = time.monotonic()
+    with _NSE_SESSION_LOCK:
+        if _NSE_SESSION is None or (now - _NSE_SESSION_PRIMED_AT) > NSE_SESSION_TTL:
+            s = requests.Session()
+            s.headers.update(NSE_HEADERS)
+
+            retry = Retry(
+                total=3,
+                backoff_factor=0.3,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET"]),
+            )
+            adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+
+            try:
+                s.get("https://www.nseindia.com", timeout=10)
+            except Exception:
+                pass
+
+            _NSE_SESSION = s
+            _NSE_SESSION_PRIMED_AT = now
+
+        return _NSE_SESSION
+
+
+_NSE_SESSION: Optional[requests.Session] = None
+_NSE_SESSION_LOCK = Lock()
+_NSE_SESSION_PRIMED_AT = 0.0
+NSE_SESSION_TTL = int(os.getenv("NSE_SESSION_TTL", "1800") or "1800")  # 30 minutes
+
+
+def nse_fresh_session() -> requests.Session:
+    """
+    Creates a new session with NSE headers + retry adapter and primes cookies.
+    Useful when a long-lived session gets blocked/stale.
+    """
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
+    retry = Retry(
+        total=2,
+        backoff_factor=0.3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+    )
+    adapter = HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     try:
         s.get("https://www.nseindia.com", timeout=10)
     except Exception:
         pass
     return s
+
+
+def reset_nse_session():
+    global _NSE_SESSION, _NSE_SESSION_PRIMED_AT
+    with _NSE_SESSION_LOCK:
+        try:
+            if _NSE_SESSION is not None:
+                _NSE_SESSION.close()
+        except Exception:
+            pass
+        _NSE_SESSION = None
+        _NSE_SESSION_PRIMED_AT = 0.0
+
+
+def prime_nse_option_chain_session(session: requests.Session):
+    """
+    NSE sometimes requires cookies set by visiting the option-chain page before the JSON API works.
+    """
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+    except Exception:
+        pass
+    try:
+        session.get("https://www.nseindia.com/option-chain", timeout=10)
+    except Exception:
+        pass
+
+
+def option_chain_headers(symbol: str) -> dict:
+    symbol = (symbol or "NIFTY").strip().upper()
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://www.nseindia.com/option-chain?symbol={symbol}",
+        "Origin": "https://www.nseindia.com",
+        "X-Requested-With": "XMLHttpRequest",
+        # Common browser-ish headers (helps on some networks / NSE edge cases)
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+    }
 
 
 # ─── DYNAMIC SYMBOL FETCHERS ─────────────────────────────────────────────────
@@ -177,7 +315,7 @@ def get_smallcap_symbols() -> list:
 def get_midcap_symbols() -> list:
     return fetch_index_symbols("NIFTY%20MIDCAP%20100", "midcap")
 
-def get_all_nse_equity_symbols(limit: int | None = None) -> list:
+def get_all_nse_equity_symbols(limit: Optional[int] = None) -> list:
     """
     Fetch all NSE equity symbols (EQ series) from the public CSV.
     Returns yfinance-compatible tickers with '.NS' suffix.
@@ -190,28 +328,29 @@ def get_all_nse_equity_symbols(limit: int | None = None) -> list:
     url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
     try:
         session = nse_session()
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
+        tickers: list[str] = []
+        seen: set[str] = set()
+        with session.get(url, timeout=20, stream=True) as resp:
+            resp.raise_for_status()
+            reader = csv.DictReader(resp.iter_lines(decode_unicode=True))
+            for row in reader:
+                sym = (row.get("SYMBOL") or "").strip()
+                if not sym:
+                    continue
+                series = (row.get("SERIES") or "").strip().upper()
+                if series and series != "EQ":
+                    continue
+                if sym in seen:
+                    continue
+                seen.add(sym)
+                tickers.append(f"{sym}.NS")
+                if limit and len(tickers) >= limit:
+                    break
 
-        df = pd.read_csv(StringIO(resp.text))
-        if "SYMBOL" not in df.columns:
-            return []
-
-        if "SERIES" in df.columns:
-            df = df[df["SERIES"].astype(str).str.upper().eq("EQ")]
-
-        symbols = (
-            df["SYMBOL"]
-            .astype(str)
-            .str.strip()
-            .replace("", pd.NA)
-            .dropna()
-            .drop_duplicates()
-            .tolist()
-        )
-        tickers = [f"{sym}.NS" for sym in symbols]
-        cache_set(cache_key, tickers)
-        return tickers[:limit] if limit else tickers
+        # Cache only the full list (not truncated) to avoid surprises.
+        if tickers and not limit:
+            cache_set(cache_key, tickers)
+        return tickers
     except Exception as e:
         logger.warning(f"[NSE] Failed to fetch equity list: {e}")
         return []
@@ -272,6 +411,265 @@ def fetch_nse_live_quotes(index_slug: str = "NIFTY%2050") -> list:
         return []
 
 
+# ─── OPTIONS OI (NIFTY) ───────────────────────────────────────────────────────
+
+OI_CACHE_TTL = int(os.getenv("OI_CACHE_TTL", "60") or "60")  # seconds
+OI_TOP_N = int(os.getenv("OI_TOP_N", "5") or "5")
+INDEX_CACHE_TTL = int(os.getenv("INDEX_CACHE_TTL", "30") or "30")  # seconds
+
+
+def fetch_nifty50_index_snapshot() -> Optional[dict]:
+    """
+    Lightweight index snapshot used for "% change" next to OI data.
+    Uses NSE `allIndices` because it returns the index row directly.
+    """
+    cache_key = "idx_nifty50_snap"
+    cached = cache_get(cache_key, ttl_seconds=INDEX_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    try:
+        session = nse_session()
+        url = "https://www.nseindia.com/api/allIndices"
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        rows = payload.get("data") or payload.get("dataList") or []
+        for r in rows:
+            name = (r.get("index") or r.get("indexName") or "").strip().upper()
+            if name == "NIFTY 50":
+                snap = {
+                    "last": r.get("last") or r.get("lastPrice"),
+                    "change": r.get("change"),
+                    "pChange": r.get("pChange"),
+                    "time": r.get("timeVal") or r.get("timestamp"),
+                }
+                cache_set(cache_key, snap)
+                return snap
+    except Exception as e:
+        logger.warning(f"[NSE] allIndices snapshot failed: {e}")
+
+    return None
+
+
+def fetch_nse_option_chain_indices(symbol: str = "NIFTY") -> Optional[dict]:
+    cache_key = f"oc_idx_{symbol}"
+    cached = cache_get(cache_key, ttl_seconds=OI_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    symbol = (symbol or "NIFTY").strip().upper()
+    # Canonical NSE option-chain URL (works in browsers; requires proper cookies/headers).
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    last_err = None
+    for attempt in (1, 2, 3):
+        try:
+            if attempt == 3:
+                session = nse_fresh_session()
+                prime_nse_option_chain_session(session)
+            else:
+                session = nse_session()
+                if attempt == 2:
+                    prime_nse_option_chain_session(session)
+            hdrs = option_chain_headers(symbol)
+            resp = session.get(
+                url,
+                timeout=15,
+                headers=hdrs,
+            )
+            if resp.status_code in (401, 403):
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                snippet = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
+                ctype = (resp.headers.get("content-type") or "").lower()
+                raise ValueError(f"Non-JSON response (status={resp.status_code}, ctype={ctype or 'unknown'}): {snippet}")
+            if not isinstance(data, dict):
+                raise ValueError(f"Unexpected option-chain payload type: {type(data).__name__}")
+
+            # NSE sometimes returns only "filtered" (or returns a message/error object).
+            if "records" not in data and isinstance(data.get("filtered"), dict):
+                data = dict(data)
+                data["records"] = data["filtered"]
+
+            if "records" not in data:
+                # Still store it briefly to avoid hammering NSE, but treat as error upstream.
+                cache_set(cache_key, data)
+                if not data:
+                    raise ValueError("Empty JSON payload (likely blocked)")
+                msg = data.get("message") or data.get("error") or data.get("msg") or f"keys={list(data)[:10]}"
+                raise ValueError(f"Missing records in payload ({msg})")
+
+            cache_set(cache_key, data)
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt == 1:
+                reset_nse_session()
+                continue
+            if attempt == 2:
+                reset_nse_session()
+                continue
+            break
+
+    logger.warning(f"[NSE] Option chain failed ({symbol}): {last_err}")
+    return {"error": "fetch_failed", "detail": str(last_err), "symbol": symbol}
+
+
+def nifty_oi_summary(top_n: int = OI_TOP_N) -> Optional[dict]:
+    def _to_int(v) -> int:
+        try:
+            if v is None:
+                return 0
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
+                return int(v)
+            if isinstance(v, str):
+                s = v.replace(",", "").strip()
+                if not s or s.upper() in ("NA", "N/A") or s in ("-", "—"):
+                    return 0
+                return int(float(s))
+            return int(v)
+        except Exception:
+            return 0
+
+    def _to_float(v) -> float:
+        try:
+            if v is None:
+                return 0.0
+            if isinstance(v, bool):
+                return float(int(v))
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                s = v.replace(",", "").strip()
+                if not s or s.upper() in ("NA", "N/A") or s in ("-", "—"):
+                    return 0.0
+                return float(s)
+            return float(v)
+        except Exception:
+            return 0.0
+
+    idx = fetch_nifty50_index_snapshot()
+    oc = fetch_nse_option_chain_indices("NIFTY")
+    if not oc:
+        return {"error": "fetch_failed", "index": idx}
+    if isinstance(oc, dict) and oc.get("error"):
+        # Attach index snapshot context to fetch errors.
+        out = dict(oc)
+        out["index"] = idx
+        return out
+
+    records = oc.get("records") or {}
+    if not isinstance(records, dict):
+        return {"error": "payload_missing_records", "index": idx, "keys": list(oc)[:10]}
+
+    chain = records.get("data")
+    if not isinstance(chain, list) or not chain:
+        filtered = oc.get("filtered")
+        if isinstance(filtered, dict) and isinstance(filtered.get("data"), list):
+            chain = filtered.get("data")
+        else:
+            chain = []
+    if not isinstance(chain, list) or not chain:
+        msg = oc.get("message") or oc.get("error") or oc.get("msg")
+        details = msg or f"keys={list(oc)[:10]}"
+        return {"error": f"empty_chain ({details})", "index": idx}
+    timestamp = records.get("timestamp") or (idx.get("time") if isinstance(idx, dict) else "") or ""
+    underlying = records.get("underlyingValue")
+    if underlying is None and isinstance(idx, dict):
+        underlying = idx.get("last")
+
+    total_ce_oi = 0
+    total_pe_oi = 0
+    total_ce_coi = 0
+    total_pe_coi = 0
+
+    ce_rows = []
+    pe_rows = []
+
+    def _pick(d: dict, keys: list[str]):
+        for k in keys:
+            if k in d:
+                return d.get(k)
+        return None
+
+    for row in chain:
+        strike = row.get("strikePrice")
+        if strike is None:
+            continue
+
+        ce = row.get("CE") or row.get("ce")
+        if isinstance(ce, dict):
+            oi = _to_int(_pick(ce, ["openInterest", "oi", "open_int"]))
+            coi = _to_int(_pick(ce, ["changeinOpenInterest", "changeInOpenInterest", "changeInOI", "coi"]))
+            ltp = _to_float(_pick(ce, ["lastPrice", "ltp", "last"]))
+            pchg = _to_float(_pick(ce, ["pChange", "pchange", "pctChange", "%Change"]))
+            total_ce_oi += oi
+            total_ce_coi += coi
+            ce_rows.append(
+                {
+                    "strike": strike,
+                    "oi": oi,
+                    "coi": coi,
+                    "coi_pct": (coi / oi * 100.0) if oi else 0.0,
+                    "ltp": ltp,
+                    "pchg": pchg,
+                }
+            )
+
+        pe = row.get("PE") or row.get("pe")
+        if isinstance(pe, dict):
+            oi = _to_int(_pick(pe, ["openInterest", "oi", "open_int"]))
+            coi = _to_int(_pick(pe, ["changeinOpenInterest", "changeInOpenInterest", "changeInOI", "coi"]))
+            ltp = _to_float(_pick(pe, ["lastPrice", "ltp", "last"]))
+            pchg = _to_float(_pick(pe, ["pChange", "pchange", "pctChange", "%Change"]))
+            total_pe_oi += oi
+            total_pe_coi += coi
+            pe_rows.append(
+                {
+                    "strike": strike,
+                    "oi": oi,
+                    "coi": coi,
+                    "coi_pct": (coi / oi * 100.0) if oi else 0.0,
+                    "ltp": ltp,
+                    "pchg": pchg,
+                }
+            )
+
+    if total_ce_oi == 0 and total_pe_oi == 0:
+        return {"error": "no_oi_fields", "index": idx, "timestamp": timestamp, "underlying": underlying}
+    if total_ce_oi == 0 and total_pe_oi > 0:
+        return {"error": "missing_call_oi", "index": idx, "timestamp": timestamp, "underlying": underlying}
+    if total_pe_oi == 0 and total_ce_oi > 0:
+        return {"error": "missing_put_oi", "index": idx, "timestamp": timestamp, "underlying": underlying}
+
+    top_ce = sorted(ce_rows, key=lambda x: x["oi"], reverse=True)[: max(1, top_n)]
+    top_pe = sorted(pe_rows, key=lambda x: x["oi"], reverse=True)[: max(1, top_n)]
+
+    pcr_oi = (total_pe_oi / total_ce_oi) if total_ce_oi else None
+    pcr_coi = (total_pe_coi / total_ce_coi) if total_ce_coi else None
+
+    return {
+        "timestamp": timestamp,
+        "underlying": underlying,
+        "index": idx,
+        "pcr_oi": pcr_oi,
+        "pcr_coi": pcr_coi,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "total_ce_coi": total_ce_coi,
+        "total_pe_coi": total_pe_coi,
+        "top_ce": top_ce,
+        "top_pe": top_pe,
+    }
+
+
 # ─── OHLCV FOR INDICATORS ────────────────────────────────────────────────────
 
 def fetch_ohlcv_bulk(symbols: list, period: str = "6mo") -> dict:
@@ -293,6 +691,80 @@ def _chunks(items: list, size: int):
         yield items[i:i + size]
 
 
+def _heap_top_n_push(heap: list, score: float, item: dict, n: int):
+    if n <= 0:
+        return
+    entry = (float(score), item)
+    if len(heap) < n:
+        heapq.heappush(heap, entry)
+        return
+    if entry[0] > heap[0][0]:
+        heapq.heapreplace(heap, entry)
+
+
+YF_CACHE_TTL = int(os.getenv("YF_CACHE_TTL", "120") or "120")  # seconds
+YF_CACHE_MAX = int(os.getenv("YF_CACHE_MAX", "2") or "2")      # cached chunks
+YF_THREADS = os.getenv("YF_THREADS", "0").strip().lower() not in ("0", "false", "no", "off")
+YF_GC_EVERY = int(os.getenv("YF_GC_EVERY", "0") or "0")        # 0 = never; else every N chunks
+
+_YF_CACHE: dict = {}
+_YF_CACHE_LOCK = Lock()
+_YF_CACHE_ORDER: list[tuple] = []
+
+
+def _yf_cache_get(key):
+    if YF_CACHE_TTL <= 0:
+        return None
+    with _YF_CACHE_LOCK:
+        entry = _YF_CACHE.get(key)
+        if not entry:
+            return None
+        df, fetched_at = entry
+        if (time.monotonic() - fetched_at) >= YF_CACHE_TTL:
+            _YF_CACHE.pop(key, None)
+            try:
+                _YF_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            return None
+        return df
+
+
+def _yf_cache_set(key, df):
+    if YF_CACHE_MAX <= 0 or YF_CACHE_TTL <= 0:
+        return
+    with _YF_CACHE_LOCK:
+        if key in _YF_CACHE:
+            _YF_CACHE[key] = (df, time.monotonic())
+            return
+        _YF_CACHE[key] = (df, time.monotonic())
+        _YF_CACHE_ORDER.append(key)
+        while len(_YF_CACHE_ORDER) > YF_CACHE_MAX:
+            old = _YF_CACHE_ORDER.pop(0)
+            _YF_CACHE.pop(old, None)
+
+
+def _yf_download_cached(tickers: list[str], period: str, interval: str):
+    tickers_sorted = tuple(sorted(tickers))
+    key = ("yf", tickers_sorted, period, interval, bool(YF_THREADS))
+    cached = _yf_cache_get(key)
+    if cached is not None:
+        return cached
+
+    with log_timing(f"yfinance.download {len(tickers_sorted)} {period} {interval}"):
+        df = yf.download(
+            " ".join(tickers_sorted),
+            period=period,
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=YF_THREADS,
+        )
+    _yf_cache_set(key, df)
+    return df
+
+
 def iter_ohlcv(symbols: list, period: str, interval: str = "1d"):
     """
     Stream OHLCV data from yfinance in chunks to avoid large peak memory usage.
@@ -301,18 +773,11 @@ def iter_ohlcv(symbols: list, period: str, interval: str = "1d"):
     if not symbols:
         return
 
+    chunk_count = 0
     for chunk in _chunks(symbols, YF_CHUNK_SIZE):
+        chunk_count += 1
         try:
-            tickers_str = " ".join(chunk)
-            df = yf.download(
-                tickers_str,
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                threads=False,  # lower peak memory; more stable on small servers
-            )
+            df = _yf_download_cached(chunk, period=period, interval=interval)
         except Exception as e:
             logger.error(f"Bulk OHLCV error (chunk): {e}")
             continue
@@ -332,12 +797,14 @@ def iter_ohlcv(symbols: list, period: str, interval: str = "1d"):
         finally:
             # Help GC release large intermediate frames sooner on low-memory hosts.
             del df
-            gc.collect()
+            if YF_GC_EVERY and (chunk_count % YF_GC_EVERY == 0):
+                gc.collect()
 
 
 # ─── SCREENERS ───────────────────────────────────────────────────────────────
 
-def screen_sma(sma_period: int, symbols: list | None = None) -> list:
+
+def screen_sma(sma_period: int, symbols: Optional[list] = None) -> list:
     """
     Screener:
     - For 10 SMA: close is above SMA(10) AND close is >= 20% below the recent high (pullback)
@@ -352,7 +819,9 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
 
     results = []
 
-    for sym, df in iter_ohlcv(symbols, period="1y", interval="1d"):
+    # 1y is needed for 10-SMA pullback high; for 100-SMA, 6mo is often sufficient.
+    period = "1y" if sma_period == 10 else os.getenv("SMA_PERIOD", "6mo").strip() or "6mo"
+    for sym, df in iter_ohlcv(symbols, period=period, interval="1d"):
         if df is None or df.empty:
             continue
         try:
@@ -428,7 +897,123 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
     return results[:RESULT_LIMIT]
 
 
-def screen_rsi(oversold: bool = True, symbols: list | None = None) -> list:
+def screen_close_above_prev_week(symbols: Optional[list] = None) -> list:
+    """
+    Screener:
+    - Latest daily close is strictly above the *previous completed week's* High.
+    - Volume: today's volume is above the average volume of the previous 14 trading days.
+
+    Notes:
+    - "Previous week" uses Fri-ending weekly buckets ("W-FRI") so Mon–Fri is one week.
+    - If the current week is in-progress (Mon–Thu), the previous completed week is the 2nd last bucket.
+    """
+    symbols = symbols or get_nifty50_symbols()
+    if not symbols:
+        return []
+
+    results = []
+    period = os.getenv("PREV_WEEK_PERIOD", "6mo").strip() or "6mo"
+
+    for sym, df in iter_ohlcv(symbols, period=period, interval="1d"):
+        if df is None or df.empty:
+            continue
+        try:
+            close_series = df.get("Close")
+            high_series = df.get("High")
+            if close_series is None or high_series is None:
+                continue
+
+            close_series = close_series.squeeze()
+            high_series = high_series.squeeze()
+            if len(close_series) < 15 or len(high_series) < 15:
+                continue
+
+            last_close = float(close_series.iloc[-1])
+            prev_close = float(close_series.iloc[-2])
+            if not price_ok(last_close):
+                continue
+
+            # Volume filter: last volume must be above avg of previous 14 sessions (exclude current).
+            vol_series = df.get("Volume")
+            if vol_series is None:
+                continue
+            vol_series = vol_series.squeeze()
+            if len(vol_series) < 15:
+                continue
+            last_vol = float(vol_series.iloc[-1])
+            avg_vol14 = float(vol_series.iloc[-15:-1].mean())
+            if pd.isna(last_vol) or pd.isna(avg_vol14) or avg_vol14 <= 0:
+                continue
+            if last_vol <= avg_vol14:
+                continue
+
+            weekly = pd.DataFrame({"High": high_series, "Close": close_series}).dropna(how="any")
+            weekly.index = pd.to_datetime(weekly.index, errors="coerce")
+            weekly = weekly.dropna(axis=0, subset=["High", "Close"])
+            if getattr(weekly.index, "tz", None) is not None:
+                weekly.index = weekly.index.tz_convert(None)
+
+            weekly = weekly.resample("W-FRI").agg({"High": "max", "Close": "last"}).dropna(how="any")
+            if len(weekly) < 2:
+                continue
+            prev_week_high = float(weekly["High"].iloc[-2])
+            if pd.isna(prev_week_high) or prev_week_high <= 0:
+                continue
+
+            if last_close <= prev_week_high:
+                continue
+
+            change = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+            results.append(
+                {
+                    "symbol": sym.replace(".NS", ""),
+                    "price": round(last_close, 2),
+                    "prev_week_high": round(prev_week_high, 2),
+                    "change": round(float(change), 2),
+                    "vol_ratio": round(last_vol / avg_vol14, 2),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Prev-week error {sym}: {e}")
+
+    results.sort(key=lambda x: x.get("change", 0), reverse=True)
+    return results[:RESULT_LIMIT]
+
+def fmt_activity(results: list, kind: str, universe_label: str) -> str:
+    if kind == "value":
+        title = "🚀 Active Value"
+        key_label = "Value"
+        sort_key = "value"
+    else:
+        title = "🚀 Active Vol"
+        key_label = "Vol"
+        sort_key = "volume"
+
+    if not results:
+        return f"❌ Could not fetch {title} data."
+
+    lines = [f"*{title}* — {universe_label}\n"]
+    for i, r in enumerate(results[:RESULT_LIMIT], 1):
+        price = r.get("price", "N/A")
+        volume = r.get("volume")
+        value = r.get("value")
+
+        if isinstance(volume, (int, float)):
+            vol_txt = f"{int(volume):,}"
+        else:
+            vol_txt = "N/A"
+
+        if isinstance(value, (int, float)):
+            val_txt = f"₹{float(value):,.0f}"
+        else:
+            val_txt = "N/A"
+
+        lines.append(f"{i}. *{r.get('symbol','')}*  ₹{price}  Vol `{vol_txt}`  Val `{val_txt}`")
+    lines.append(f"\n_NSE/yfinance · {ts()}_")
+    return "\n".join(lines)
+
+
+def screen_rsi(oversold: bool = True, symbols: Optional[list] = None) -> list:
     """
     1. Fetch live Nifty 50 symbols from NSE
     2. Download OHLCV from yfinance
@@ -505,17 +1090,6 @@ def screen_top_movers(top_n: int = RESULT_LIMIT, gainers: bool = True) -> list:
 
     fallback.sort(key=lambda x: x["change"], reverse=gainers)
     return fallback[:top_n]
-
-def _heap_top_n_push(heap: list, key: float, item: dict, n: int):
-    if n <= 0:
-        return
-    if len(heap) < n:
-        heapq.heappush(heap, (key, item))
-    else:
-        if key > heap[0][0]:
-            heapq.heapreplace(heap, (key, item))
-
-
 def screen_active_vol(symbols: list, universe: str) -> list:
     """
     Top active volume.
@@ -623,41 +1197,197 @@ def screen_fundamentals(cap_type: str) -> list:
     if not symbols:
         return []
 
-    results = []
-    for sym in symbols:
-        try:
-            info = yf.Ticker(sym).info
-            if not info:
-                continue
+    fund_ttl = int(os.getenv("FUND_CACHE_TTL", "21600") or "21600")  # 6 hours
+    workers = int(os.getenv("FUND_WORKERS", "5") or "5")
 
-            name   = info.get("shortName") or info.get("longName") or sym.replace(".NS", "")
-            price  = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+    def fetch_one(sym: str):
+        cached = cache_get(f"fund_{sym}", ttl_seconds=fund_ttl)
+        if cached is not None:
+            return cached
+
+        try:
+            with log_timing(f"yfinance.info {sym}"):
+                info = yf.Ticker(sym).info
+            if not info:
+                return None
+
+            name = info.get("shortName") or info.get("longName") or sym.replace(".NS", "")
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
             if not price_ok(price):
-                continue
+                return None
             mktcap = info.get("marketCap") or 0
-            pe     = info.get("trailingPE")
-            pb     = info.get("priceToBook")
-            roe    = info.get("returnOnEquity")
-            eps    = info.get("trailingEps")
-            div    = info.get("dividendYield")
+            pe = info.get("trailingPE")
+            pb = info.get("priceToBook")
+            roe = info.get("returnOnEquity")
+            eps = info.get("trailingEps")
+            div = info.get("dividendYield")
             sector = info.get("sector") or "—"
 
-            results.append({
+            row = {
                 "symbol": sym.replace(".NS", ""),
-                "name":   name[:22],
+                "name": name[:22],
                 "sector": sector[:18],
-                "price":  round(price, 2) if price else "N/A",
+                "price": round(price, 2) if price else "N/A",
                 "mktcap": f"₹{mktcap/1e9:.1f}B" if mktcap else "N/A",
-                "pe":     round(pe, 1) if pe else "N/A",
-                "pb":     round(pb, 2) if pb else "N/A",
-                "roe":    f"{roe*100:.1f}%" if roe else "N/A",
-                "eps":    round(eps, 2) if eps else "N/A",
-                "div":    f"{div*100:.2f}%" if div else "N/A",
-            })
+                "pe": round(pe, 1) if pe else "N/A",
+                "pb": round(pb, 2) if pb else "N/A",
+                "roe": f"{roe*100:.1f}%" if roe else "N/A",
+                "eps": round(eps, 2) if eps else "N/A",
+                "div": f"{div*100:.2f}%" if div else "N/A",
+            }
+            cache_set(f"fund_{sym}", row)
+            return row
         except Exception as e:
             logger.warning(f"Fundamental error {sym}: {e}")
+            return None
 
+    results_by_pos: list[tuple[int, dict]] = []
+    with log_timing(f"fundamentals {cap_type} ({len(symbols)} tickers)"):
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futures = {ex.submit(fetch_one, sym): i for i, sym in enumerate(symbols)}
+            for fut in as_completed(futures):
+                pos = futures[fut]
+                row = fut.result()
+                if row:
+                    results_by_pos.append((pos, row))
+
+    results_by_pos.sort(key=lambda x: x[0])
+    results = [row for _, row in results_by_pos]
     return results[:RESULT_LIMIT]
+
+
+def md_escape(text) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
+def nse_autocomplete_symbol(query: str) -> Optional[str]:
+    """
+    Best-effort NSE autocomplete: lets users type a company name and we pick a symbol.
+    Returns something like 'RELIANCE' (without .NS).
+    """
+    try:
+        session = nse_session()
+        url = "https://www.nseindia.com/api/search/autocomplete"
+        resp = session.get(url, params={"q": query}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = []
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            candidates = data.get("symbols") or data.get("data") or data.get("items") or []
+        for c in candidates or []:
+            if not isinstance(c, dict):
+                continue
+            sym = c.get("symbol") or c.get("symbolCode") or c.get("underlying") or c.get("underlyingSymbol")
+            if sym:
+                return str(sym).strip().upper()
+    except Exception:
+        return None
+    return None
+
+
+def fetch_nse_equity_quote(symbol: str) -> Optional[dict]:
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        session = nse_session()
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+        resp = session.get(
+            url,
+            timeout=15,
+            headers={
+                "Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def stock_info(query: str) -> Optional[dict]:
+    """
+    Single-stock info lookup. User can provide symbol (RELIANCE) or a company name.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    symbol = q.upper().replace(".NS", "").strip()
+    if " " in q or len(symbol) > 12:
+        sym2 = nse_autocomplete_symbol(q)
+        if sym2:
+            symbol = sym2
+
+    ticker = f"{symbol}.NS"
+    info = {"symbol": symbol}
+
+    nse = fetch_nse_equity_quote(symbol)
+    if isinstance(nse, dict):
+        price_info = nse.get("priceInfo") or {}
+        meta = nse.get("metadata") or {}
+        if isinstance(price_info, dict):
+            info["price"] = price_info.get("lastPrice")
+            info["change_pct"] = price_info.get("pChange")
+            info["open"] = price_info.get("open")
+            info["high"] = price_info.get("intraDayHighLow", {}).get("max") if isinstance(price_info.get("intraDayHighLow"), dict) else price_info.get("dayHigh")
+            info["low"] = price_info.get("intraDayHighLow", {}).get("min") if isinstance(price_info.get("intraDayHighLow"), dict) else price_info.get("dayLow")
+            info["52w_high"] = price_info.get("weekHighLow", {}).get("max") if isinstance(price_info.get("weekHighLow"), dict) else None
+            info["52w_low"] = price_info.get("weekHighLow", {}).get("min") if isinstance(price_info.get("weekHighLow"), dict) else None
+        if isinstance(meta, dict):
+            info["name"] = meta.get("companyName") or meta.get("symbol") or info.get("name")
+            info["industry"] = meta.get("industry") or info.get("industry")
+            info["last_update"] = meta.get("lastUpdateTime") or meta.get("lastUpdate") or info.get("last_update")
+
+    try:
+        yf_t = yf.Ticker(ticker)
+        fast = getattr(yf_t, "fast_info", None)
+        if isinstance(fast, dict):
+            info.setdefault("price", fast.get("last_price") or fast.get("lastPrice"))
+            if "change_pct" not in info:
+                prev_close = fast.get("previous_close") or fast.get("previousClose")
+                last_price = fast.get("last_price") or fast.get("lastPrice")
+                try:
+                    if prev_close and last_price:
+                        info["change_pct"] = (float(last_price) - float(prev_close)) / float(prev_close) * 100.0
+                except Exception:
+                    pass
+            info.setdefault("open", fast.get("open"))
+            info.setdefault("high", fast.get("day_high") or fast.get("dayHigh"))
+            info.setdefault("low", fast.get("day_low") or fast.get("dayLow"))
+            info.setdefault("52w_high", fast.get("year_high") or fast.get("yearHigh"))
+            info.setdefault("52w_low", fast.get("year_low") or fast.get("yearLow"))
+            info.setdefault("volume", fast.get("last_volume") or fast.get("lastVolume"))
+            info.setdefault("mktcap", fast.get("market_cap") or fast.get("marketCap"))
+
+        yfi = yf_t.info or {}
+        if isinstance(yfi, dict) and yfi:
+            info.setdefault("name", yfi.get("shortName") or yfi.get("longName"))
+            info.setdefault("sector", yfi.get("sector"))
+            info.setdefault("industry", yfi.get("industry"))
+            info.setdefault("pe", yfi.get("trailingPE") or yfi.get("forwardPE"))
+            info.setdefault("pb", yfi.get("priceToBook"))
+            info.setdefault("eps", yfi.get("trailingEps"))
+            info.setdefault("roe", yfi.get("returnOnEquity"))
+            info.setdefault("div_yield", yfi.get("dividendYield"))
+            info.setdefault("beta", yfi.get("beta"))
+            info.setdefault("currency", yfi.get("currency"))
+    except Exception:
+        pass
+
+    return info
 
 
 # ─── FORMATTERS ──────────────────────────────────────────────────────────────
@@ -680,6 +1410,118 @@ def fmt_sma(results: list, period: int, universe_label: str = "Nifty 50") -> str
         vx = f"  Vx`{r['vol_ratio']}`" if "vol_ratio" in r else ""
         lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  SMA={r['sma']}{dd}{vx}")
     lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
+    return "\n".join(lines)
+
+
+def fmt_prev_week(results: list, universe_label: str = "Nifty 50") -> str:
+    if not results:
+        return f"❌ No {universe_label} stocks with close above previous week's High right now."
+
+    title = f"📊 *Close > Previous Week High* — {len(results)} stocks"
+    lines = [f"{title}\n"]
+    for r in results[:RESULT_LIMIT]:
+        dot = "🟢" if r["change"] >= 0 else "🔴"
+        vx = f"  Vx`{r['vol_ratio']}`" if "vol_ratio" in r else ""
+        lines.append(
+            f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  PWH={r['prev_week_high']}{vx}"
+        )
+    lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
+    return "\n".join(lines)
+
+
+def fmt_nifty_oi(summary: Optional[dict]) -> str:
+    if not summary:
+        return "❌ Could not fetch NIFTY option-chain data right now (NSE may be blocking/slow). Try again in 30–60s."
+    if isinstance(summary, dict) and summary.get("error"):
+        err = summary.get("error")
+        detail = summary.get("detail")
+        detail_txt = ""
+        if detail:
+            detail_txt = f"\n`{str(detail)[:180]}`"
+        return f"❌ Could not fetch NIFTY option-chain data right now: `{err}` (try again in 30–60s){detail_txt}"
+
+    underlying = summary.get("underlying")
+    if underlying is None:
+        underlying = "N/A"
+    timestamp = summary.get("timestamp") or ts()
+    idx = summary.get("index") or {}
+    idx_pchg = idx.get("pChange")
+    pcr_oi = summary.get("pcr_oi")
+    pcr_coi = summary.get("pcr_coi")
+
+    hdr = "📌 *NIFTY Option Chain — Top OI*"
+    lines = [hdr]
+    idx_txt = ""
+    if idx_pchg is not None:
+        try:
+            idx_txt = f"  NIFTY %Chg: `{float(idx_pchg):+.2f}%`"
+        except (TypeError, ValueError):
+            idx_txt = ""
+    if isinstance(pcr_oi, (int, float)) and isinstance(pcr_coi, (int, float)):
+        lines.append(f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi:.2f}`  PCR(ΔOI): `{pcr_coi:.2f}`")
+    else:
+        lines.append(
+            f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi if pcr_oi is not None else 'N/A'}`  PCR(ΔOI): `{pcr_coi if pcr_coi is not None else 'N/A'}`"
+        )
+
+    lines.append("\n*Top CE OI*")
+    for r in (summary.get("top_ce") or [])[:OI_TOP_N]:
+        lines.append(
+            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
+        )
+
+    lines.append("\n*Top PE OI*")
+    for r in (summary.get("top_pe") or [])[:OI_TOP_N]:
+        lines.append(
+            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
+        )
+
+    lines.append(f"\n_NSE Option Chain · {timestamp}_")
+    return "\n".join(lines)
+
+
+def fmt_nifty_oi_side(summary: Optional[dict], side: str) -> str:
+    if not summary:
+        return fmt_nifty_oi(summary)
+    if isinstance(summary, dict) and summary.get("error"):
+        return fmt_nifty_oi(summary)
+
+    side = (side or "").strip().upper()
+    if side not in ("CE", "PE"):
+        side = "CE"
+
+    underlying = summary.get("underlying")
+    if underlying is None:
+        underlying = "N/A"
+    timestamp = summary.get("timestamp") or ts()
+    idx = summary.get("index") or {}
+    idx_pchg = idx.get("pChange")
+    pcr_oi = summary.get("pcr_oi")
+    pcr_coi = summary.get("pcr_coi")
+
+    idx_txt = ""
+    if idx_pchg is not None:
+        try:
+            idx_txt = f"  NIFTY %Chg: `{float(idx_pchg):+.2f}%`"
+        except (TypeError, ValueError):
+            idx_txt = ""
+
+    title = "📌 *NIFTY Top CE OI*" if side == "CE" else "📌 *NIFTY Top PE OI*"
+    lines = [title]
+    if isinstance(pcr_oi, (int, float)) and isinstance(pcr_coi, (int, float)):
+        lines.append(f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi:.2f}`  PCR(ΔOI): `{pcr_coi:.2f}`")
+    else:
+        lines.append(
+            f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi if pcr_oi is not None else 'N/A'}`  PCR(ΔOI): `{pcr_coi if pcr_coi is not None else 'N/A'}`"
+        )
+
+    rows = (summary.get("top_ce") if side == "CE" else summary.get("top_pe")) or []
+    for r in rows[:OI_TOP_N]:
+        lines.append(
+            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
+        )
+
+    lines.append(f"\n_NSE Option Chain · {timestamp}_")
     return "\n".join(lines)
 
 
@@ -707,39 +1549,6 @@ def fmt_movers(results: list, gainers: bool) -> str:
     lines.append(f"\n_NSE Live · {ts()}_")
     return "\n".join(lines)
 
-def fmt_activity(results: list, kind: str, universe_label: str) -> str:
-    if kind == "value":
-        title = "🚀 Active Value"
-        key_label = "Value"
-        sort_key = "value"
-    else:
-        title = "🚀 Active Vol"
-        key_label = "Vol"
-        sort_key = "volume"
-
-    if not results:
-        return f"❌ Could not fetch {title} data."
-
-    lines = [f"*{title}* — {universe_label}\n"]
-    for i, r in enumerate(results[:RESULT_LIMIT], 1):
-        price = r.get("price", "N/A")
-        volume = r.get("volume")
-        value = r.get("value")
-
-        if isinstance(volume, (int, float)):
-            vol_txt = f"{int(volume):,}"
-        else:
-            vol_txt = "N/A"
-
-        if isinstance(value, (int, float)):
-            val_txt = f"₹{float(value):,.0f}"
-        else:
-            val_txt = "N/A"
-
-        lines.append(f"{i}. *{r.get('symbol','')}*  ₹{price}  Vol `{vol_txt}`  Val `{val_txt}`")
-    lines.append(f"\n_NSE/yfinance · {ts()}_")
-    return "\n".join(lines)
-
 
 def fmt_fundamentals(results: list, cap_type: str) -> str:
     emoji = "🔹" if cap_type == "small" else "🔷"
@@ -747,7 +1556,7 @@ def fmt_fundamentals(results: list, cap_type: str) -> str:
     if not results:
         return f"❌ Could not fetch {label} data."
     lines = [f"{emoji} *{label}*\n"]
-    for r in results[:RESULT_LIMIT]:
+    for r in results[:10]:
         lines.append(
             f"*{r['symbol']}*  _{r['name']}_\n"
             f"  Sector: {r['sector']}\n"
@@ -759,14 +1568,72 @@ def fmt_fundamentals(results: list, cap_type: str) -> str:
     return "\n".join(lines)
 
 
+def fmt_stock_info(info: Optional[dict]) -> str:
+    if not info or not isinstance(info, dict) or not info.get("symbol"):
+        return "❌ Stock not found. Please send an NSE symbol like `RELIANCE`, `TCS`, `INFY`."
+
+    sym = md_escape(info.get("symbol"))
+    name = md_escape(info.get("name") or "")
+    sector = md_escape(info.get("sector") or "—")
+    industry = md_escape(info.get("industry") or "—")
+
+    def n(v, suffix: str = ""):
+        if v is None or v == "":
+            return "N/A"
+        try:
+            if isinstance(v, (int, float)):
+                return f"{v:,.2f}{suffix}".replace(",", "")
+            return f"{v}{suffix}"
+        except Exception:
+            return str(v)
+
+    price = info.get("price")
+    chg = info.get("change_pct")
+    open_ = info.get("open")
+    high = info.get("high")
+    low = info.get("low")
+    w52h = info.get("52w_high")
+    w52l = info.get("52w_low")
+    vol = info.get("volume")
+    mcap = info.get("mktcap")
+    pe = info.get("pe")
+    pb = info.get("pb")
+    eps = info.get("eps")
+    roe = info.get("roe")
+    divy = info.get("div_yield")
+    beta = info.get("beta")
+    last_update = info.get("last_update") or ts()
+
+    lines = [f"📄 *Stock Info — {sym}*"]
+    if name:
+        lines.append(f"_{name}_")
+    if price is not None:
+        chg_txt = f"  `{float(chg):+.2f}%`" if isinstance(chg, (int, float)) else (f"  `{chg}`" if chg is not None else "")
+        lines.append(f"Price: ₹`{n(price)}`{chg_txt}")
+    lines.append(f"O/H/L: `{n(open_)}` / `{n(high)}` / `{n(low)}`")
+    lines.append(f"52W H/L: `{n(w52h)}` / `{n(w52l)}`")
+    if vol is not None:
+        lines.append(f"Volume: `{n(vol)}`")
+    if mcap is not None:
+        lines.append(f"MCap: `{n(mcap)}`")
+
+    lines.append(f"P/E: `{n(pe)}`  P/B: `{n(pb)}`  EPS: `{n(eps)}`")
+    lines.append(f"ROE: `{n(roe)}`  DivY: `{n(divy)}`  Beta: `{n(beta)}`")
+    lines.append(f"Sector: {sector}")
+    lines.append(f"Industry: {industry}")
+    lines.append(f"\n_NSE/yfinance · {md_escape(last_update)}_")
+    return "\n".join(lines)
+
+
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🇮🇳 *Indian Stock Market Screener*\n\n"
-        "All data is fetched *live from NSE* — no hardcoded symbols.\n\n"
+        "All data is fetched *live from NSE* \n\n"
         "📊 *Technical* — SMA & RSI on live Nifty 50 constituents\n"
         "📈 *Fundamental* — Live small/mid cap snapshots\n"
+        "📌 *OI Data* — NIFTY option-chain Top OI + PCR\n"
         f"🚀 *Gainers* / 📉 *Losers* — Top {RESULT_LIMIT} NSE movers",
         parse_mode="Markdown",
         reply_markup=HOME_KEYBOARD,
@@ -778,12 +1645,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Menu navigation (no data fetch) ──
     if text in ("🏠 Home", "/start"):
+        context.user_data.pop("awaiting_stock_info", None)
         await update.message.reply_text(
             "🏠 *Home*", parse_mode="Markdown", reply_markup=HOME_KEYBOARD
         )
         return
 
     if text == "📊 Technical":
+        context.user_data.pop("awaiting_stock_info", None)
         await update.message.reply_text(
             "📊 *Technical Screener* — Choose a signal:",
             parse_mode="Markdown",
@@ -811,6 +1680,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📈 Fundamental":
+        context.user_data.pop("awaiting_stock_info", None)
         await update.message.reply_text(
             "📈 *Fundamental Screener* — Choose a cap size:",
             parse_mode="Markdown",
@@ -818,61 +1688,130 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if text == "📄 Stock Info":
+        context.user_data["awaiting_stock_info"] = True
+        await update.message.reply_text(
+            "📄 *Stock Info*\n\nSend the stock *symbol* (example: `RELIANCE`, `TCS`, `INFY`) or company name.",
+            parse_mode="Markdown",
+            reply_markup=FUNDAMENTAL_KEYBOARD,
+        )
+        return
+
+    if text == "📌 OI Data":
+        context.user_data.pop("awaiting_stock_info", None)
+        await update.message.reply_text(
+            "📌 *OI Data* — Choose:",
+            parse_mode="Markdown",
+            reply_markup=OI_KEYBOARD,
+        )
+        return
+
+    if context.user_data.get("awaiting_stock_info"):
+        context.user_data.pop("awaiting_stock_info", None)
+        thinking = await update.message.reply_text("⏳ Fetching stock info…")
+        loop = asyncio.get_running_loop()
+        try:
+            async with HEAVY_WORK_SEM:
+                info = await loop.run_in_executor(None, lambda: stock_info(text))
+            msg = fmt_stock_info(info)
+            await thinking.delete()
+            await update.message.reply_text(
+                msg, parse_mode="Markdown", reply_markup=FUNDAMENTAL_KEYBOARD
+            )
+        except Exception:
+            await thinking.delete()
+            await update.message.reply_text(
+                "⚠️ Error fetching stock info. Try again with an NSE symbol like `RELIANCE`.",
+                parse_mode="Markdown",
+                reply_markup=FUNDAMENTAL_KEYBOARD,
+            )
+        return
+
     # ── Data-fetching actions ──
+    t0 = time.perf_counter()
     thinking = await update.message.reply_text("⏳ Fetching live data from NSE…")
     loop = asyncio.get_running_loop()
 
     try:
-        universe = (context.user_data.get("universe") or UNIVERSE_NIFTY50).lower()
-        symbols = get_symbols_for_universe(universe)
-        universe_label = UNIVERSE_LABELS.get(universe, "Nifty 50")
+        async with HEAVY_WORK_SEM:
+            if text in ("📌 Nifty OI", "📌 Nifty OI Summary", "📌 Top CE OI", "📌 Top PE OI"):
+                summary = await loop.run_in_executor(None, nifty_oi_summary)
+                if text == "📌 Top PE OI":
+                    msg = fmt_nifty_oi_side(summary, "PE")
+                elif text == "📌 Top CE OI":
+                    msg = fmt_nifty_oi_side(summary, "CE")
+                else:
+                    msg = fmt_nifty_oi(summary)
+            else:
+                universe = (context.user_data.get("universe") or UNIVERSE_NIFTY50).lower()
+                universe_label = UNIVERSE_LABELS.get(universe, "Nifty 50")
+                symbols = None
 
-        if text == "📉 10 SMA":
-            data = await loop.run_in_executor(None, lambda: screen_sma(10, symbols=symbols))
-            msg  = fmt_sma(data, 10, universe_label=universe_label)
+                needs_symbols = text in (
+                    "📉 10 SMA",
+                    "📈 100 SMA",
+                    "📈 Prev Week High",
+                    "🔵 RSI Oversold",
+                    "🔴 RSI Overbought",
+                    "🚀 Active Value",
+                    "🚀 Actve Value",
+                    "🚀 Active Val",
+                    "🚀 Actve Val",
+                    "🚀 Active Vol",
+                )
+                if needs_symbols:
+                    with log_timing(f"symbols {universe}"):
+                        symbols = get_symbols_for_universe(universe)
 
-        elif text == "📈 100 SMA":
-            data = await loop.run_in_executor(None, lambda: screen_sma(100, symbols=symbols))
-            msg  = fmt_sma(data, 100, universe_label=universe_label)
+                if text == "📉 10 SMA":
+                    data = await loop.run_in_executor(None, lambda: screen_sma(10, symbols=symbols))
+                    msg  = fmt_sma(data, 10, universe_label=universe_label)
 
-        elif text == "🔵 RSI Oversold":
-            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=True, symbols=symbols))
-            msg  = fmt_rsi(data, oversold=True, universe_label=universe_label)
+                elif text in ("📈 100 SMA", "📈 Prev Week High"):
+                    data = await loop.run_in_executor(None, lambda: screen_close_above_prev_week(symbols=symbols))
+                    msg  = fmt_prev_week(data, universe_label=universe_label)
 
-        elif text == "🔴 RSI Overbought":
-            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=False, symbols=symbols))
-            msg  = fmt_rsi(data, oversold=False, universe_label=universe_label)
+                elif text == "🔵 RSI Oversold":
+                    data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=True, symbols=symbols))
+                    msg  = fmt_rsi(data, oversold=True, universe_label=universe_label)
 
-        elif text in ("🚀 Active Val", "🚀 Actve Val"):
-            data = await loop.run_in_executor(None, lambda: screen_active_value(symbols, universe))
-            msg  = fmt_activity(data, "value", universe_label)
+                elif text == "🔴 RSI Overbought":
+                    data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=False, symbols=symbols))
+                    msg  = fmt_rsi(data, oversold=False, universe_label=universe_label)
 
-        elif text == "🚀 Active Vol":
-            data = await loop.run_in_executor(None, lambda: screen_active_vol(symbols, universe))
-            msg  = fmt_activity(data, "vol", universe_label)
+                elif text == "📉 Top 5 Losers":
+                    data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=False))
+                    msg  = fmt_movers(data, gainers=False)
 
-        elif text == "📉 Top Losers":
-            data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=False))
-            msg  = fmt_movers(data, gainers=False)
+                elif text == "🚀 Top 5 Gainers":
+                    data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=True))
+                    msg  = fmt_movers(data, gainers=True)
 
-        elif text == "🚀 Top Gainers":
-            data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=True))
-            msg  = fmt_movers(data, gainers=True)
+                elif text in ("🚀 Active Value", "🚀 Actve Value", "🚀 Active Val", "🚀 Actve Val"):
+                    data = await loop.run_in_executor(None, lambda: screen_active_value(symbols, universe))
+                    msg  = fmt_activity(data, "value", universe_label)
 
-        elif text == "🔹 Small Cap":
-            data = await loop.run_in_executor(None, lambda: screen_fundamentals("small"))
-            msg  = fmt_fundamentals(data, "small")
+                elif text == "🚀 Active Vol":
+                    data = await loop.run_in_executor(None, lambda: screen_active_vol(symbols, universe))
+                    msg  = fmt_activity(data, "vol", universe_label)
 
-        elif text == "🔷 Mid Cap":
-            data = await loop.run_in_executor(None, lambda: screen_fundamentals("mid"))
-            msg  = fmt_fundamentals(data, "mid")
+                elif text == "🔹 Small Cap":
+                    data = await loop.run_in_executor(None, lambda: screen_fundamentals("small"))
+                    msg  = fmt_fundamentals(data, "small")
 
-        else:
-            await thinking.delete()
-            await update.message.reply_text(
-                "❓ Use the menu buttons to navigate.", reply_markup=HOME_KEYBOARD
-            )
-            return
+                elif text == "🔷 Mid Cap":
+                    data = await loop.run_in_executor(None, lambda: screen_fundamentals("mid"))
+                    msg  = fmt_fundamentals(data, "mid")
+
+                else:
+                    await thinking.delete()
+                    await update.message.reply_text(
+                        "❓ Use the menu buttons to navigate.", reply_markup=HOME_KEYBOARD
+                    )
+                    return
+
+        if os.getenv("SHOW_RESPONSE_TIME", "").strip().lower() in ("1", "true", "yes", "on"):
+            msg += f"\n\n_⏱ {time.perf_counter() - t0:.2f}s_"
 
         await thinking.delete()
         # Split if message exceeds Telegram's 4096 char limit
