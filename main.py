@@ -84,6 +84,11 @@ NSE_HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
+# Optional proxy support (useful if you have a static-IP proxy).
+# Example: set `NSE_PROXY=http://user:pass@1.2.3.4:8080`
+NSE_PROXY = os.getenv("NSE_PROXY", "").strip()
+NSE_TRUST_ENV = os.getenv("NSE_TRUST_ENV", "1").strip().lower() not in ("0", "false", "no", "off")
+
 # Simple in-memory LRU cache: {key: (data, fetched_at_monotonic)}
 _CACHE: "OrderedDict[str, tuple[object, float]]" = OrderedDict()
 _CACHE_LOCK = Lock()
@@ -157,7 +162,7 @@ FUNDAMENTAL_KEYBOARD = ReplyKeyboardMarkup(
 
 OI_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📌 Top CE OI"), KeyboardButton("📌 Top PE OI")],
+        [KeyboardButton("📌 Top CE OI"), KeyboardButton("📌 Top PE OI"),KeyboardButton("OI Analysis")],
         [KeyboardButton("🏠 Home")],
     ],
     resize_keyboard=True,
@@ -174,6 +179,9 @@ def nse_session() -> requests.Session:
         if _NSE_SESSION is None or (now - _NSE_SESSION_PRIMED_AT) > NSE_SESSION_TTL:
             s = requests.Session()
             s.headers.update(NSE_HEADERS)
+            s.trust_env = NSE_TRUST_ENV
+            if NSE_PROXY:
+                s.proxies.update({"http": NSE_PROXY, "https": NSE_PROXY})
 
             retry = Retry(
                 total=3,
@@ -209,6 +217,9 @@ def nse_fresh_session() -> requests.Session:
     """
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
+    s.trust_env = NSE_TRUST_ENV
+    if NSE_PROXY:
+        s.proxies.update({"http": NSE_PROXY, "https": NSE_PROXY})
     retry = Retry(
         total=2,
         backoff_factor=0.3,
@@ -452,15 +463,20 @@ def fetch_nifty50_index_snapshot() -> Optional[dict]:
     return None
 
 
-def fetch_nse_option_chain_indices(symbol: str = "NIFTY") -> Optional[dict]:
-    cache_key = f"oc_idx_{symbol}"
+def fetch_nse_derivatives_nextapi(symbol: str = "NIFTY") -> Optional[dict]:
+    """
+    NSE NextApi endpoint (as provided by user) for derivatives/option data.
+    """
+    cache_key = f"oc_nextapi_{symbol}"
     cached = cache_get(cache_key, ttl_seconds=OI_CACHE_TTL)
     if cached is not None:
         return cached
 
     symbol = (symbol or "NIFTY").strip().upper()
-    # Canonical NSE option-chain URL (works in browsers; requires proper cookies/headers).
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    url = (
+        "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+        f"?functionName=getSymbolDerivativesData&symbol={symbol}"
+    )
     last_err = None
     for attempt in (1, 2, 3):
         try:
@@ -489,13 +505,63 @@ def fetch_nse_option_chain_indices(symbol: str = "NIFTY") -> Optional[dict]:
             if not isinstance(data, dict):
                 raise ValueError(f"Unexpected option-chain payload type: {type(data).__name__}")
 
+            cache_set(cache_key, data)
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt == 1:
+                reset_nse_session()
+                continue
+            if attempt == 2:
+                reset_nse_session()
+                continue
+            break
+
+    logger.warning(f"[NSE] NextApi derivatives failed ({symbol}): {last_err}")
+    return {"error": "fetch_failed", "detail": str(last_err), "symbol": symbol}
+
+
+def fetch_nse_option_chain_indices(symbol: str = "NIFTY") -> Optional[dict]:
+    """
+    NSE classic option-chain API (fallback).
+    """
+    cache_key = f"oc_idx_{symbol}"
+    cached = cache_get(cache_key, ttl_seconds=OI_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    symbol = (symbol or "NIFTY").strip().upper()
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    last_err = None
+    for attempt in (1, 2, 3):
+        try:
+            if attempt == 3:
+                session = nse_fresh_session()
+                prime_nse_option_chain_session(session)
+            else:
+                session = nse_session()
+                if attempt == 2:
+                    prime_nse_option_chain_session(session)
+
+            resp = session.get(url, timeout=15, headers=option_chain_headers(symbol))
+            if resp.status_code in (401, 403):
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                snippet = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
+                ctype = (resp.headers.get("content-type") or "").lower()
+                raise ValueError(f"Non-JSON response (status={resp.status_code}, ctype={ctype or 'unknown'}): {snippet}")
+            if not isinstance(data, dict):
+                raise ValueError(f"Unexpected option-chain payload type: {type(data).__name__}")
+
             # NSE sometimes returns only "filtered" (or returns a message/error object).
             if "records" not in data and isinstance(data.get("filtered"), dict):
                 data = dict(data)
                 data["records"] = data["filtered"]
 
             if "records" not in data:
-                # Still store it briefly to avoid hammering NSE, but treat as error upstream.
                 cache_set(cache_key, data)
                 if not data:
                     raise ValueError("Empty JSON payload (likely blocked)")
@@ -506,10 +572,7 @@ def fetch_nse_option_chain_indices(symbol: str = "NIFTY") -> Optional[dict]:
             return data
         except Exception as e:
             last_err = e
-            if attempt == 1:
-                reset_nse_session()
-                continue
-            if attempt == 2:
+            if attempt in (1, 2):
                 reset_nse_session()
                 continue
             break
@@ -555,33 +618,178 @@ def nifty_oi_summary(top_n: int = OI_TOP_N) -> Optional[dict]:
         except Exception:
             return 0.0
 
+    def _select_band(rows: list, target: float, count: int, direction: str) -> list:
+        """
+        Select `count` strikes starting from nearest to target.
+        direction: "up" or "down"
+        """
+        if not rows:
+            return []
+        strikes = sorted({float(r["strike"]) for r in rows if r.get("strike") is not None})
+        if not strikes:
+            return []
+        # find nearest strike to target
+        nearest = min(strikes, key=lambda s: abs(s - target))
+        try:
+            idx = strikes.index(nearest)
+        except ValueError:
+            idx = 0
+        # Filter to 100-interval strikes if possible
+        filt = [s for s in strikes if (int(round(s)) % 100) == 0]
+        if filt:
+            strikes = filt
+            try:
+                idx = strikes.index(min(strikes, key=lambda s: abs(s - target)))
+            except ValueError:
+                idx = 0
+        if direction == "up":
+            sel = strikes[idx: idx + count]
+        else:
+            start = max(0, idx - (count - 1))
+            sel = strikes[start: idx + 1]
+            sel = list(reversed(sel))
+        # map back to rows with CE/PE dict
+        by_strike = {float(r["strike"]): r for r in rows if r.get("strike") is not None}
+        return [by_strike[s] for s in sel if s in by_strike]
+
     idx = fetch_nifty50_index_snapshot()
-    oc = fetch_nse_option_chain_indices("NIFTY")
+
+    def _walk(obj):
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                yield cur
+                for v in cur.values():
+                    stack.append(v)
+            elif isinstance(cur, list):
+                for v in cur:
+                    stack.append(v)
+
+    def _parse_expiry(s: str):
+        if not s or not isinstance(s, str):
+            return None
+        s = s.strip()
+        for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except Exception:
+                pass
+        return None
+
+    def _extract_from_option_chain_indices(payload: dict):
+        records = payload.get("records") or {}
+        if not isinstance(records, dict):
+            return None
+        chain = records.get("data")
+        if not isinstance(chain, list) or not chain:
+            filtered = payload.get("filtered")
+            if isinstance(filtered, dict) and isinstance(filtered.get("data"), list):
+                chain = filtered.get("data")
+            else:
+                chain = []
+        if not chain:
+            return None
+        ts_ = records.get("timestamp") or ""
+        und_ = records.get("underlyingValue")
+        return chain, ts_, und_
+
+    def _extract_from_nextapi(payload: dict):
+        # Find contracts either as rows with CE/PE or as flat dicts with optionType/strikePrice.
+        candidates = []
+        for d in _walk(payload):
+            if "strikePrice" in d and ("CE" in d or "PE" in d or "optionType" in d or "instrumentType" in d):
+                candidates.append(d)
+            elif "optionType" in d and ("openInterest" in d or "changeinOpenInterest" in d) and ("strikePrice" in d or "strike" in d):
+                candidates.append(d)
+
+        if not candidates:
+            return None
+
+        # If these are already CE/PE rows, return them as-is.
+        if any(("CE" in c or "PE" in c) and "strikePrice" in c for c in candidates):
+            rows = [c for c in candidates if "strikePrice" in c and ("CE" in c or "PE" in c)]
+            ts_ = None
+            und_ = None
+            for d in _walk(payload):
+                if und_ is None and any(k in d for k in ("underlyingValue", "underlying")):
+                    und_ = d.get("underlyingValue") or d.get("underlying")
+                if ts_ is None and any(k in d for k in ("timestamp", "time", "timeStamp", "lastUpdateTime")):
+                    ts_ = d.get("timestamp") or d.get("time") or d.get("timeStamp") or d.get("lastUpdateTime")
+            return rows, ts_ or "", und_
+
+        # Otherwise treat as flat contracts and aggregate by strike.
+        flat = []
+        for c in candidates:
+            if "optionType" in c and ("strikePrice" in c or "strike" in c):
+                flat.append(c)
+        if not flat:
+            return None
+
+        # Filter to nearest expiry if possible.
+        expiry_dates = []
+        for c in flat:
+            exp = c.get("expiryDate") or c.get("expiry") or c.get("expirydate")
+            d = _parse_expiry(exp) if isinstance(exp, str) else None
+            if d:
+                expiry_dates.append(d)
+        sel_exp = min(expiry_dates) if expiry_dates else None
+
+        by_strike = {}
+        for c in flat:
+            exp = c.get("expiryDate") or c.get("expiry") or c.get("expirydate")
+            d = _parse_expiry(exp) if isinstance(exp, str) else None
+            if sel_exp and d and d != sel_exp:
+                continue
+            strike = c.get("strikePrice") or c.get("strike")
+            if strike is None:
+                continue
+            try:
+                strike_val = float(strike)
+            except Exception:
+                continue
+            otype = (c.get("optionType") or c.get("otype") or "").strip().upper()
+            if otype not in ("CE", "PE", "CALL", "PUT"):
+                inst = str(c.get("instrumentType") or "").upper()
+                if "CE" in inst:
+                    otype = "CE"
+                elif "PE" in inst:
+                    otype = "PE"
+            side = "CE" if otype in ("CE", "CALL") else ("PE" if otype in ("PE", "PUT") else None)
+            if not side:
+                continue
+            row = by_strike.setdefault(strike_val, {"strikePrice": strike_val})
+            row[side] = c
+
+        rows = list(by_strike.values())
+        ts_ = None
+        und_ = None
+        for d in _walk(payload):
+            if und_ is None and any(k in d for k in ("underlyingValue", "underlying", "underlyingIndex")):
+                und_ = d.get("underlyingValue") or d.get("underlying") or d.get("underlyingIndex")
+            if ts_ is None and any(k in d for k in ("timestamp", "time", "timeStamp", "lastUpdateTime")):
+                ts_ = d.get("timestamp") or d.get("time") or d.get("timeStamp") or d.get("lastUpdateTime")
+        return rows, ts_ or "", und_
+
+    oc = fetch_nse_derivatives_nextapi("NIFTY")
+    source = "nextapi"
+    if not oc or (isinstance(oc, dict) and oc.get("error")):
+        oc = fetch_nse_option_chain_indices("NIFTY")
+        source = "optionchain"
+
     if not oc:
         return {"error": "fetch_failed", "index": idx}
     if isinstance(oc, dict) and oc.get("error"):
-        # Attach index snapshot context to fetch errors.
         out = dict(oc)
         out["index"] = idx
         return out
 
-    records = oc.get("records") or {}
-    if not isinstance(records, dict):
-        return {"error": "payload_missing_records", "index": idx, "keys": list(oc)[:10]}
-
-    chain = records.get("data")
-    if not isinstance(chain, list) or not chain:
-        filtered = oc.get("filtered")
-        if isinstance(filtered, dict) and isinstance(filtered.get("data"), list):
-            chain = filtered.get("data")
-        else:
-            chain = []
-    if not isinstance(chain, list) or not chain:
-        msg = oc.get("message") or oc.get("error") or oc.get("msg")
-        details = msg or f"keys={list(oc)[:10]}"
-        return {"error": f"empty_chain ({details})", "index": idx}
-    timestamp = records.get("timestamp") or (idx.get("time") if isinstance(idx, dict) else "") or ""
-    underlying = records.get("underlyingValue")
+    extracted = _extract_from_nextapi(oc) if source == "nextapi" else _extract_from_option_chain_indices(oc)
+    if not extracted:
+        return {"error": "empty_chain", "index": idx, "source": source, "keys": list(oc)[:10] if isinstance(oc, dict) else None}
+    chain, timestamp, underlying = extracted
+    if not timestamp and isinstance(idx, dict):
+        timestamp = idx.get("time") or ""
     if underlying is None and isinstance(idx, dict):
         underlying = idx.get("last")
 
@@ -642,6 +850,10 @@ def nifty_oi_summary(top_n: int = OI_TOP_N) -> Optional[dict]:
                 }
             )
 
+    underlying_val = _to_float(underlying)
+    band_ce = _select_band(ce_rows, underlying_val + 100.0, 5, "up")
+    band_pe = _select_band(pe_rows, underlying_val - 100.0, 5, "down")
+
     if total_ce_oi == 0 and total_pe_oi == 0:
         return {"error": "no_oi_fields", "index": idx, "timestamp": timestamp, "underlying": underlying}
     if total_ce_oi == 0 and total_pe_oi > 0:
@@ -659,6 +871,7 @@ def nifty_oi_summary(top_n: int = OI_TOP_N) -> Optional[dict]:
         "timestamp": timestamp,
         "underlying": underlying,
         "index": idx,
+        "source": source,
         "pcr_oi": pcr_oi,
         "pcr_coi": pcr_coi,
         "total_ce_oi": total_ce_oi,
@@ -667,6 +880,8 @@ def nifty_oi_summary(top_n: int = OI_TOP_N) -> Optional[dict]:
         "total_pe_coi": total_pe_coi,
         "top_ce": top_ce,
         "top_pe": top_pe,
+        "band_ce": band_ce,
+        "band_pe": band_pe,
     }
 
 
@@ -1265,6 +1480,57 @@ def md_escape(text) -> str:
     return s
 
 
+FO_CACHE_TTL = int(os.getenv("FO_CACHE_TTL", "3600") or "3600")
+
+
+def _normalize_name(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+def fetch_fo_securities_details() -> list:
+    """
+    Fetch NSE "Securities in F&O" list with symbols and names for matching.
+    """
+    cache_key = "fo_securities_list"
+    cached = cache_get(cache_key, ttl_seconds=FO_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    try:
+        session = nse_session()
+        url = "https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O"
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json().get("data", [])
+        out = []
+        for item in raw:
+            sym = item.get("symbol")
+            name = item.get("companyName") or item.get("company") or item.get("name")
+            if sym:
+                out.append({"symbol": str(sym).strip().upper(), "name": str(name or "").strip()})
+        cache_set(cache_key, out)
+        return out
+    except Exception:
+        return []
+
+
+def match_symbol_from_fo(query: str) -> Optional[str]:
+    qn = _normalize_name(query or "")
+    if not qn:
+        return None
+    items = fetch_fo_securities_details()
+    # First try exact symbol match
+    for it in items:
+        if _normalize_name(it.get("symbol", "")) == qn:
+            return it.get("symbol")
+    # Then try name contains
+    for it in items:
+        name = _normalize_name(it.get("name", ""))
+        if qn and name and qn in name:
+            return it.get("symbol")
+    return None
+
+
 def nse_autocomplete_symbol(query: str) -> Optional[str]:
     """
     Best-effort NSE autocomplete: lets users type a company name and we pick a symbol.
@@ -1330,6 +1596,10 @@ def stock_info(query: str) -> Optional[dict]:
         sym2 = nse_autocomplete_symbol(q)
         if sym2:
             symbol = sym2
+        else:
+            sym3 = match_symbol_from_fo(q)
+            if sym3:
+                symbol = sym3
 
     ticker = f"{symbol}.NS"
     info = {"symbol": symbol}
@@ -1431,14 +1701,14 @@ def fmt_prev_week(results: list, universe_label: str = "Nifty 50") -> str:
 
 def fmt_nifty_oi(summary: Optional[dict]) -> str:
     if not summary:
-        return "❌ Could not fetch NIFTY option-chain data right now (NSE may be blocking/slow). Try again in 30–60s."
+        return "❌ Could not fetch NIFTY OI data right now (NSE may be blocking/slow). Try again in 30–60s."
     if isinstance(summary, dict) and summary.get("error"):
         err = summary.get("error")
         detail = summary.get("detail")
         detail_txt = ""
         if detail:
             detail_txt = f"\n`{str(detail)[:180]}`"
-        return f"❌ Could not fetch NIFTY option-chain data right now: `{err}` (try again in 30–60s){detail_txt}"
+        return f"❌ Could not fetch NIFTY OI data: `{err}` (try again in 30–60s){detail_txt}"
 
     underlying = summary.get("underlying")
     if underlying is None:
@@ -1449,34 +1719,125 @@ def fmt_nifty_oi(summary: Optional[dict]) -> str:
     pcr_oi = summary.get("pcr_oi")
     pcr_coi = summary.get("pcr_coi")
 
-    hdr = "📌 *NIFTY Option Chain — Top OI*"
+    hdr = "📌 *NIFTY OI Dashboard*"
+    src = summary.get("source")
+    if src:
+        hdr = f"{hdr} _({md_escape(src)})_"
     lines = [hdr]
     idx_txt = ""
     if idx_pchg is not None:
         try:
-            idx_txt = f"  NIFTY %Chg: `{float(idx_pchg):+.2f}%`"
+            v = float(idx_pchg)
+            arrow = "🔺" if v >= 0 else "🔻"
+            idx_txt = f"  {arrow} *%Chg* `{v:+.2f}%`"
         except (TypeError, ValueError):
             idx_txt = ""
+
     if isinstance(pcr_oi, (int, float)) and isinstance(pcr_coi, (int, float)):
-        lines.append(f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi:.2f}`  PCR(ΔOI): `{pcr_coi:.2f}`")
+        lines.append(f"📈 *Underlying* `{underlying}`{idx_txt}")
+        lines.append(f"⚖️ *PCR*  OI `{pcr_oi:.2f}`  ΔOI `{pcr_coi:.2f}`")
     else:
-        lines.append(
-            f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi if pcr_oi is not None else 'N/A'}`  PCR(ΔOI): `{pcr_coi if pcr_coi is not None else 'N/A'}`"
-        )
+        lines.append(f"📈 *Underlying* `{underlying}`{idx_txt}")
+        lines.append(f"⚖️ *PCR*  OI `{pcr_oi if pcr_oi is not None else 'N/A'}`  ΔOI `{pcr_coi if pcr_coi is not None else 'N/A'}`")
 
-    lines.append("\n*Top CE OI*")
-    for r in (summary.get("top_ce") or [])[:OI_TOP_N]:
-        lines.append(
-            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
-        )
+    top_ce = (summary.get("top_ce") or [])[:OI_TOP_N]
+    top_pe = (summary.get("top_pe") or [])[:OI_TOP_N]
 
-    lines.append("\n*Top PE OI*")
-    for r in (summary.get("top_pe") or [])[:OI_TOP_N]:
-        lines.append(
-            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
-        )
+    def bar(oi: int, max_oi: int, width: int = 20) -> str:
+        if max_oi <= 0:
+            return ""
+        n = int(round((oi / max_oi) * width))
+        return "#" * max(0, n)
 
-    lines.append(f"\n_NSE Option Chain · {timestamp}_")
+    band_ce = summary.get("band_ce") or top_ce
+    band_pe = summary.get("band_pe") or top_pe
+
+    max_oi_ce = max((int(r.get("oi") or 0) for r in band_ce), default=0)
+    max_oi_pe = max((int(r.get("oi") or 0) for r in band_pe), default=0)
+
+    lines.append("\nTop CE OI (from NIFTY +100, 5 strikes)")
+    for r in band_ce:
+        strike = r.get("strike")
+        oi = int(r.get("oi") or 0)
+        lines.append(f"{str(strike):>7} | {bar(oi, max_oi_ce):<20} {oi}")
+
+    lines.append("\nTop PE OI (from NIFTY -100, 5 strikes)")
+    for r in band_pe:
+        strike = r.get("strike")
+        oi = int(r.get("oi") or 0)
+        lines.append(f"{str(strike):>7} | {bar(oi, max_oi_pe):<20} {oi}")
+
+    lines.append(f"\nTime: {timestamp}")
+    return "\n".join(lines)
+
+
+def fmt_nifty_oi_analysis(summary: Optional[dict]) -> str:
+    if not summary:
+        return "OI analysis unavailable (no data)."
+    if isinstance(summary, dict) and summary.get("error"):
+        return fmt_nifty_oi(summary)
+
+    pcr_oi = summary.get("pcr_oi")
+    pcr_coi = summary.get("pcr_coi")
+    idx = summary.get("index") or {}
+    idx_pchg = idx.get("pChange")
+    underlying = summary.get("underlying") or "N/A"
+
+    if not isinstance(pcr_oi, (int, float)) or not isinstance(pcr_coi, (int, float)):
+        return "OI analysis unavailable (insufficient OI data)."
+
+    bullish_score = 0
+    bearish_score = 0
+
+    if pcr_oi >= 1.20:
+        bullish_score += 1
+    elif pcr_oi <= 0.80:
+        bearish_score += 1
+
+    if pcr_coi >= 1.10:
+        bullish_score += 1
+    elif pcr_coi <= 0.90:
+        bearish_score += 1
+
+    if isinstance(idx_pchg, (int, float)):
+        if idx_pchg >= 0.20:
+            bullish_score += 1
+        elif idx_pchg <= -0.20:
+            bearish_score += 1
+
+    def score_to_label(score: int) -> str:
+        if score >= 3:
+            return "High"
+        if score == 2:
+            return "Medium"
+        if score == 1:
+            return "Low"
+        return "Very Low"
+
+    bullish = score_to_label(bullish_score)
+    bearish = score_to_label(bearish_score)
+    if bullish_score > bearish_score:
+        bias = "Bullish"
+    elif bearish_score > bullish_score:
+        bias = "Bearish"
+    else:
+        bias = "Neutral"
+
+    # Convert score difference into a simple probability estimate.
+    net = bullish_score - bearish_score
+    bullish_pct = max(10, min(90, 50 + net * 10))
+    bearish_pct = 100 - bullish_pct
+
+    lines = [
+        "OI Analysis (NIFTY)",
+        f"Underlying: {underlying}",
+        f"PCR(OI): {pcr_oi:.2f}  PCR(Delta OI): {pcr_coi:.2f}",
+        f"Index %Chg: {idx_pchg if idx_pchg is not None else 'N/A'}",
+        f"Bullish chance: {bullish} ({bullish_pct}%)",
+        f"Bearish chance: {bearish} ({bearish_pct}%)",
+        f"Bias: {bias}",
+        "Note: This is a simple OI/PCR heuristic, not financial advice.",
+    ]
     return "\n".join(lines)
 
 
@@ -1502,26 +1863,36 @@ def fmt_nifty_oi_side(summary: Optional[dict], side: str) -> str:
     idx_txt = ""
     if idx_pchg is not None:
         try:
-            idx_txt = f"  NIFTY %Chg: `{float(idx_pchg):+.2f}%`"
+            v = float(idx_pchg)
+            arrow = "🔺" if v >= 0 else "🔻"
+            idx_txt = f"  {arrow} *%Chg* `{v:+.2f}%`"
         except (TypeError, ValueError):
             idx_txt = ""
 
     title = "📌 *NIFTY Top CE OI*" if side == "CE" else "📌 *NIFTY Top PE OI*"
     lines = [title]
     if isinstance(pcr_oi, (int, float)) and isinstance(pcr_coi, (int, float)):
-        lines.append(f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi:.2f}`  PCR(ΔOI): `{pcr_coi:.2f}`")
+        lines.append(f"📈 *Underlying* `{underlying}`{idx_txt}")
+        lines.append(f"⚖️ *PCR*  OI `{pcr_oi:.2f}`  ΔOI `{pcr_coi:.2f}`")
     else:
-        lines.append(
-            f"Underlying: `{underlying}`{idx_txt}  PCR(OI): `{pcr_oi if pcr_oi is not None else 'N/A'}`  PCR(ΔOI): `{pcr_coi if pcr_coi is not None else 'N/A'}`"
-        )
+        lines.append(f"📈 *Underlying* `{underlying}`{idx_txt}")
+        lines.append(f"⚖️ *PCR*  OI `{pcr_oi if pcr_oi is not None else 'N/A'}`  ΔOI `{pcr_coi if pcr_coi is not None else 'N/A'}`")
 
-    rows = (summary.get("top_ce") if side == "CE" else summary.get("top_pe")) or []
-    for r in rows[:OI_TOP_N]:
-        lines.append(
-            f"• `{r['strike']}`  OI `{r['oi']}`  ΔOI `{r['coi']}` (`{r['coi_pct']:+.1f}%`)  LTP `{r['ltp']}`  %Chg `{r['pchg']:+.2f}%`"
-        )
+    def bar(oi: int, max_oi: int, width: int = 20) -> str:
+        if max_oi <= 0:
+            return ""
+        n = int(round((oi / max_oi) * width))
+        return "#" * max(0, n)
 
-    lines.append(f"\n_NSE Option Chain · {timestamp}_")
+    band = summary.get("band_ce") if side == "CE" else summary.get("band_pe")
+    rows = (band or [])[:5]
+    max_oi = max((int(r.get("oi") or 0) for r in rows), default=0)
+    for r in rows:
+        strike = r.get("strike")
+        oi = int(r.get("oi") or 0)
+        lines.append(f"{str(strike):>7} | {bar(oi, max_oi):<20} {oi}")
+
+    lines.append(f"\nTime: {timestamp}")
     return "\n".join(lines)
 
 
@@ -1734,9 +2105,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with HEAVY_WORK_SEM:
-            if text in ("📌 Nifty OI", "📌 Nifty OI Summary", "📌 Top CE OI", "📌 Top PE OI"):
+            if text in ("📌 Nifty OI", "📌 Nifty OI Summary", "📌 Top CE OI", "📌 Top PE OI", "OI Analysis"):
                 summary = await loop.run_in_executor(None, nifty_oi_summary)
-                if text == "📌 Top PE OI":
+                if text == "OI Analysis":
+                    msg = fmt_nifty_oi_analysis(summary)
+                elif text == "📌 Top PE OI":
                     msg = fmt_nifty_oi_side(summary, "PE")
                 elif text == "📌 Top CE OI":
                     msg = fmt_nifty_oi_side(summary, "CE")
