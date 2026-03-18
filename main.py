@@ -21,6 +21,8 @@ import pandas as pd
 import yfinance as yf
 import ta
 from datetime import datetime
+from zoneinfo import ZoneInfo
+from io import StringIO
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -29,7 +31,28 @@ from telegram.ext import (
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "827676884:AAHXXKkJ0YTTEIOiCUN5xHOmrWO27wHsN_U")
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "6039703460:AAFOJDkr5BT5ffhIQ2UCiVuWeZXnHxG2W4M")
+
+UNIVERSE_NIFTY50 = "nifty50"
+UNIVERSE_ALL = "all"
+
+UNIVERSE_LABELS = {
+    UNIVERSE_NIFTY50: "Nifty 50",
+    UNIVERSE_ALL: "All Stocks",
+}
+
+MIN_PRICE = float(os.getenv("MIN_PRICE", "100") or "100")
+
+
+def price_ok(price) -> bool:
+    try:
+        # "Above 100" means strictly greater than the threshold.
+        return float(price) > MIN_PRICE
+    except (TypeError, ValueError):
+        return False
+
+IST = ZoneInfo("Asia/Kolkata")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
 }
@@ -48,9 +72,9 @@ _CACHE: dict = {}
 CACHE_TTL = 600  # 10 minutes
 
 
-def cache_get(key: str):
+def cache_get(key: str, ttl_seconds: int = CACHE_TTL):
     entry = _CACHE.get(key)
-    if entry and (datetime.now() - entry[1]).seconds < CACHE_TTL:
+    if entry and (datetime.now() - entry[1]).seconds < ttl_seconds:
         return entry[0]
     return None
 
@@ -71,6 +95,7 @@ HOME_KEYBOARD = ReplyKeyboardMarkup(
 
 TECHNICAL_KEYBOARD = ReplyKeyboardMarkup(
     [
+        [KeyboardButton("🧺 Nifty 50"), KeyboardButton("🌐 All Stocks")],
         [KeyboardButton("📉 10 SMA"), KeyboardButton("📈 100 SMA")],
         [KeyboardButton("🔵 RSI Oversold"), KeyboardButton("🔴 RSI Overbought")],
         [KeyboardButton("🏠 Home")],
@@ -139,11 +164,58 @@ def get_nifty50_symbols() -> list:
 
 
 def get_smallcap_symbols() -> list:
-    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap", limit=25)
+    return fetch_index_symbols("NIFTY%20SMALLCAP%20100", "smallcap")
 
 
 def get_midcap_symbols() -> list:
-    return fetch_index_symbols("NIFTY%20MIDCAP%20100", "midcap", limit=25)
+    return fetch_index_symbols("NIFTY%20MIDCAP%20100", "midcap")
+
+def get_all_nse_equity_symbols(limit: int | None = None) -> list:
+    """
+    Fetch all NSE equity symbols (EQ series) from the public CSV.
+    Returns yfinance-compatible tickers with '.NS' suffix.
+    """
+    cache_key = "nse_equity_list_eq"
+    cached = cache_get(cache_key, ttl_seconds=24 * 60 * 60)
+    if cached:
+        return cached[:limit] if limit else cached
+
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+    try:
+        session = nse_session()
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+
+        df = pd.read_csv(StringIO(resp.text))
+        if "SYMBOL" not in df.columns:
+            return []
+
+        if "SERIES" in df.columns:
+            df = df[df["SERIES"].astype(str).str.upper().eq("EQ")]
+
+        symbols = (
+            df["SYMBOL"]
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .drop_duplicates()
+            .tolist()
+        )
+        tickers = [f"{sym}.NS" for sym in symbols]
+        cache_set(cache_key, tickers)
+        return tickers[:limit] if limit else tickers
+    except Exception as e:
+        logger.warning(f"[NSE] Failed to fetch equity list: {e}")
+        return []
+
+
+def get_symbols_for_universe(universe: str) -> list:
+    if universe == UNIVERSE_ALL:
+        max_symbols_env = os.getenv("MAX_SYMBOLS", "").strip()
+        limit = int(max_symbols_env) if max_symbols_env.isdigit() else None
+        return get_all_nse_equity_symbols(limit=limit)
+    return get_nifty50_symbols()
 
 
 # ─── LIVE NSE MARKET DATA ────────────────────────────────────────────────────
@@ -230,13 +302,15 @@ def fetch_ohlcv_bulk(symbols: list, period: str = "6mo") -> dict:
 
 # ─── SCREENERS ───────────────────────────────────────────────────────────────
 
-def screen_sma(sma_period: int) -> list:
+def screen_sma(sma_period: int, symbols: list | None = None) -> list:
     """
-    1. Fetch live Nifty 50 symbols from NSE
-    2. Download historical OHLCV from yfinance
-    3. Return stocks where close > SMA(sma_period)
+    Screener:
+    - For 10 SMA: close is above SMA(10) AND close is >= 20% below the recent high (pullback)
+    - For other periods: close is above SMA(period)
+
+    Recent high is computed from the last ~1y of daily candles fetched from yfinance (adjusted OHLCV).
     """
-    symbols = get_nifty50_symbols()
+    symbols = symbols or get_nifty50_symbols()
     if not symbols:
         return []
 
@@ -246,31 +320,69 @@ def screen_sma(sma_period: int) -> list:
     for sym, df in raw.items():
         try:
             close = df["Close"].squeeze()
-            sma   = close.rolling(window=sma_period).mean()
+            if len(close) < sma_period + 2:
+                continue
+
+            sma = close.rolling(window=sma_period).mean()
             if pd.isna(sma.iloc[-1]):
                 continue
-            if float(close.iloc[-1]) > float(sma.iloc[-1]):
-                change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100
-                results.append({
-                    "symbol": sym.replace(".NS", ""),
-                    "price":  round(float(close.iloc[-1]), 2),
-                    "sma":    round(float(sma.iloc[-1]), 2),
-                    "change": round(float(change), 2),
-                })
+
+            last_close = float(close.iloc[-1])
+            prev_close = float(close.iloc[-2])
+            last_sma = float(sma.iloc[-1])
+
+            if not price_ok(last_close):
+                continue
+
+            if last_close <= last_sma:
+                continue
+
+            # Apply the pullback constraint only for the 10-SMA screener.
+            recent_high = None
+            drawdown = None
+            if sma_period == 10:
+                # Use the adjusted "High" series for a practical "recent high".
+                high_series = df.get("High")
+                if high_series is None:
+                    continue
+                recent_high = float(high_series.iloc[-252:].max())  # ~1 trading year
+                if not recent_high or pd.isna(recent_high):
+                    continue
+
+                drawdown = (recent_high - last_close) / recent_high  # 0.20 = 20% down from high
+                if drawdown < 0.20:
+                    continue
+
+            change = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+            row = {
+                "symbol": sym.replace(".NS", ""),
+                "price": round(last_close, 2),
+                "sma": round(last_sma, 2),
+                "change": round(float(change), 2),
+            }
+            if sma_period == 10 and recent_high is not None and drawdown is not None:
+                row["recent_high"] = round(float(recent_high), 2)
+                row["drawdown_pct"] = round(float(drawdown) * 100.0, 1)
+
+            results.append(row)
         except Exception as e:
             logger.warning(f"SMA error {sym}: {e}")
 
-    results.sort(key=lambda x: x["change"], reverse=True)
+    if sma_period == 10:
+        # Prefer deeper pullbacks first; then day change.
+        results.sort(key=lambda x: (x.get("drawdown_pct", 0), x.get("change", 0)), reverse=True)
+    else:
+        results.sort(key=lambda x: x.get("change", 0), reverse=True)
     return results
 
 
-def screen_rsi(oversold: bool = True) -> list:
+def screen_rsi(oversold: bool = True, symbols: list | None = None) -> list:
     """
     1. Fetch live Nifty 50 symbols from NSE
     2. Download OHLCV from yfinance
     3. Compute RSI(14) — return oversold < 30 or overbought > 70
     """
-    symbols = get_nifty50_symbols()
+    symbols = symbols or get_nifty50_symbols()
     if not symbols:
         return []
 
@@ -280,6 +392,10 @@ def screen_rsi(oversold: bool = True) -> list:
     for sym, df in raw.items():
         try:
             close      = df["Close"].squeeze()
+            last_close = float(close.iloc[-1])
+            if not price_ok(last_close):
+                continue
+
             rsi_series = ta.momentum.RSIIndicator(close=close, window=14).rsi()
             rsi_val    = float(rsi_series.iloc[-1])
             if pd.isna(rsi_val):
@@ -289,7 +405,7 @@ def screen_rsi(oversold: bool = True) -> list:
                 change = ((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2]) * 100
                 results.append({
                     "symbol": sym.replace(".NS", ""),
-                    "price":  round(float(close.iloc[-1]), 2),
+                    "price":  round(last_close, 2),
                     "rsi":    round(rsi_val, 1),
                     "change": round(float(change), 2),
                 })
@@ -308,6 +424,7 @@ def screen_top_movers(top_n: int = 5, gainers: bool = True) -> list:
     quotes = fetch_nse_live_quotes("NIFTY%2050")
 
     if quotes:
+        quotes = [q for q in quotes if price_ok(q.get("price"))]
         quotes.sort(key=lambda x: x["change"], reverse=gainers)
         return quotes[:top_n]
 
@@ -322,6 +439,8 @@ def screen_top_movers(top_n: int = 5, gainers: bool = True) -> list:
         try:
             c0 = float(df["Close"].iloc[-1])
             c1 = float(df["Close"].iloc[-2])
+            if not price_ok(c0):
+                continue
             fallback.append({
                 "symbol": sym.replace(".NS", ""),
                 "price":  round(c0, 2),
@@ -352,6 +471,8 @@ def screen_fundamentals(cap_type: str) -> list:
 
             name   = info.get("shortName") or info.get("longName") or sym.replace(".NS", "")
             price  = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+            if not price_ok(price):
+                continue
             mktcap = info.get("marketCap") or 0
             pe     = info.get("trailingPE")
             pb     = info.get("priceToBook")
@@ -381,21 +502,26 @@ def screen_fundamentals(cap_type: str) -> list:
 # ─── FORMATTERS ──────────────────────────────────────────────────────────────
 
 def ts() -> str:
-    return datetime.now().strftime("%d %b %Y %H:%M IST")
+    return datetime.now(IST).strftime("%d %b %Y %H:%M IST")
 
 
-def fmt_sma(results: list, period: int) -> str:
+def fmt_sma(results: list, period: int, universe_label: str = "Nifty 50") -> str:
     if not results:
-        return f"❌ No Nifty 50 stocks above {period}-Day SMA right now."
-    lines = [f"📊 *Above {period}-Day SMA* — {len(results)} stocks\n"]
+        if period == 10:
+            return f"❌ No {universe_label} stocks meet: pullback ≥20% from recent high + close above 10-Day SMA."
+        return f"❌ No {universe_label} stocks above {period}-Day SMA right now."
+
+    title = f"📊 *Pullback ≥20% + Above {period}-Day SMA* — {len(results)} stocks" if period == 10 else f"📊 *Above {period}-Day SMA* — {len(results)} stocks"
+    lines = [f"{title}\n"]
     for r in results[:15]:
         dot = "🟢" if r["change"] >= 0 else "🔴"
-        lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  SMA={r['sma']}")
-    lines.append(f"\n_Nifty 50 · NSE Live · {ts()}_")
+        dd = f"  DD `{r['drawdown_pct']:.1f}%`" if period == 10 and "drawdown_pct" in r else ""
+        lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  SMA={r['sma']}{dd}")
+    lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
     return "\n".join(lines)
 
 
-def fmt_rsi(results: list, oversold: bool) -> str:
+def fmt_rsi(results: list, oversold: bool, universe_label: str = "Nifty 50") -> str:
     label = "Oversold  RSI < 30 🔵" if oversold else "Overbought  RSI > 70 🔴"
     if not results:
         return f"❌ No stocks in the {label} zone right now."
@@ -403,7 +529,7 @@ def fmt_rsi(results: list, oversold: bool) -> str:
     for r in results[:15]:
         dot = "🟢" if r["change"] >= 0 else "🔴"
         lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  RSI `{r['rsi']}`")
-    lines.append(f"\n_Nifty 50 · NSE Live · {ts()}_")
+    lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
     return "\n".join(lines)
 
 
@@ -470,6 +596,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if text == "🧺 Nifty 50":
+        context.user_data["universe"] = UNIVERSE_NIFTY50
+        await update.message.reply_text(
+            "Universe set to *Nifty 50*.",
+            parse_mode="Markdown",
+            reply_markup=TECHNICAL_KEYBOARD,
+        )
+        return
+
+    if text == "🌐 All Stocks":
+        context.user_data["universe"] = UNIVERSE_ALL
+        await update.message.reply_text(
+            "Universe set to *All Stocks*.\n"
+            "Note: this can be slow; optional `MAX_SYMBOLS=500` to cap the universe.",
+            parse_mode="Markdown",
+            reply_markup=TECHNICAL_KEYBOARD,
+        )
+        return
+
     if text == "📈 Fundamental":
         await update.message.reply_text(
             "📈 *Fundamental Screener* — Choose a cap size:",
@@ -480,24 +625,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Data-fetching actions ──
     thinking = await update.message.reply_text("⏳ Fetching live data from NSE…")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     try:
+        universe = (context.user_data.get("universe") or UNIVERSE_NIFTY50).lower()
+        symbols = get_symbols_for_universe(universe)
+        universe_label = UNIVERSE_LABELS.get(universe, "Nifty 50")
+
         if text == "📉 10 SMA":
-            data = await loop.run_in_executor(None, lambda: screen_sma(10))
-            msg  = fmt_sma(data, 10)
+            data = await loop.run_in_executor(None, lambda: screen_sma(10, symbols=symbols))
+            msg  = fmt_sma(data, 10, universe_label=universe_label)
 
         elif text == "📈 100 SMA":
-            data = await loop.run_in_executor(None, lambda: screen_sma(100))
-            msg  = fmt_sma(data, 100)
+            data = await loop.run_in_executor(None, lambda: screen_sma(100, symbols=symbols))
+            msg  = fmt_sma(data, 100, universe_label=universe_label)
 
         elif text == "🔵 RSI Oversold":
-            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=True))
-            msg  = fmt_rsi(data, oversold=True)
+            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=True, symbols=symbols))
+            msg  = fmt_rsi(data, oversold=True, universe_label=universe_label)
 
         elif text == "🔴 RSI Overbought":
-            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=False))
-            msg  = fmt_rsi(data, oversold=False)
+            data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=False, symbols=symbols))
+            msg  = fmt_rsi(data, oversold=False, universe_label=universe_label)
 
         elif text == "📉 Top 5 Losers":
             data = await loop.run_in_executor(None, lambda: screen_top_movers(5, gainers=False))
@@ -539,15 +688,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌  Set TELEGRAM_BOT_TOKEN environment variable first.")
+    if not BOT_TOKEN:
+        print("ERROR: Set TELEGRAM_BOT_TOKEN environment variable first.")
         return
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🚀  Indian Stock Screener Bot running — symbols fetched live from NSE")
+    print("Indian Stock Screener Bot running - symbols fetched live from NSE")
     app.run_polling(drop_pending_updates=True)
 
 
