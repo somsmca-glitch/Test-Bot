@@ -23,6 +23,8 @@ import ta
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from io import StringIO
+import gc
+import heapq
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -30,6 +32,7 @@ from telegram.ext import (
 )
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
+
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "6039703460:AAFOJDkr5BT5ffhIQ2UCiVuWeZXnHxG2W4M")
@@ -43,6 +46,9 @@ UNIVERSE_LABELS = {
 }
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "100") or "100")
+# Keep results bounded to avoid time/memory blowups.
+RESULT_LIMIT = 5
+YF_CHUNK_SIZE = int(os.getenv("YF_CHUNK_SIZE", "50") or "50")
 
 
 def price_ok(price) -> bool:
@@ -88,7 +94,7 @@ def cache_set(key: str, value):
 HOME_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Technical"), KeyboardButton("📈 Fundamental")],
-        [KeyboardButton("📉 Top 5 Losers"), KeyboardButton("🚀 Top 5 Gainers")],
+        [KeyboardButton("📉 Top Losers"), KeyboardButton("🚀 Top Gainers"),KeyboardButton("🚀 Active Val"), KeyboardButton("🚀 Active Vol")],
     ],
     resize_keyboard=True,
 )
@@ -98,6 +104,7 @@ TECHNICAL_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("🧺 Nifty 50"), KeyboardButton("🌐 All Stocks")],
         [KeyboardButton("📉 10 SMA"), KeyboardButton("📈 100 SMA")],
         [KeyboardButton("🔵 RSI Oversold"), KeyboardButton("🔴 RSI Overbought")],
+       
         [KeyboardButton("🏠 Home")],
     ],
     resize_keyboard=True,
@@ -271,33 +278,61 @@ def fetch_ohlcv_bulk(symbols: list, period: str = "6mo") -> dict:
     """Bulk download OHLCV from yfinance for indicator computation."""
     if not symbols:
         return {}
-    try:
-        tickers_str = " ".join(symbols)
-        df = yf.download(
-            tickers_str,
-            period=period,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        result = {}
-        if len(symbols) == 1:
-            if not df.empty and len(df) > 20:
-                result[symbols[0]] = df
-        else:
-            for sym in symbols:
-                try:
-                    sub = df[sym].dropna(how="all")
-                    if not sub.empty and len(sub) > 20:
-                        result[sym] = sub
-                except KeyError:
-                    pass
-        return result
-    except Exception as e:
-        logger.error(f"Bulk OHLCV error: {e}")
-        return {}
+    result = {}
+    for sym, df in iter_ohlcv(symbols, period=period, interval="1d"):
+        if df is None or df.empty or len(df) <= 20:
+            continue
+        result[sym] = df
+    return result
+
+
+def _chunks(items: list, size: int):
+    if size <= 0:
+        size = 50
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def iter_ohlcv(symbols: list, period: str, interval: str = "1d"):
+    """
+    Stream OHLCV data from yfinance in chunks to avoid large peak memory usage.
+    Yields (symbol, df) where symbol includes '.NS' suffix.
+    """
+    if not symbols:
+        return
+
+    for chunk in _chunks(symbols, YF_CHUNK_SIZE):
+        try:
+            tickers_str = " ".join(chunk)
+            df = yf.download(
+                tickers_str,
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=False,  # lower peak memory; more stable on small servers
+            )
+        except Exception as e:
+            logger.error(f"Bulk OHLCV error (chunk): {e}")
+            continue
+
+        try:
+            if len(chunk) == 1:
+                sym = chunk[0]
+                if df is not None and not df.empty:
+                    yield sym, df
+            else:
+                for sym in chunk:
+                    try:
+                        sub = df[sym].dropna(how="all")
+                        yield sym, sub
+                    except Exception:
+                        yield sym, None
+        finally:
+            # Help GC release large intermediate frames sooner on low-memory hosts.
+            del df
+            gc.collect()
 
 
 # ─── SCREENERS ───────────────────────────────────────────────────────────────
@@ -307,6 +342,7 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
     Screener:
     - For 10 SMA: close is above SMA(10) AND close is >= 20% below the recent high (pullback)
     - For other periods: close is above SMA(period)
+    - Volume: today's volume is above the average volume of the previous 14 trading days
 
     Recent high is computed from the last ~1y of daily candles fetched from yfinance (adjusted OHLCV).
     """
@@ -314,10 +350,11 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
     if not symbols:
         return []
 
-    raw = fetch_ohlcv_bulk(symbols, period="1y")
     results = []
 
-    for sym, df in raw.items():
+    for sym, df in iter_ohlcv(symbols, period="1y", interval="1d"):
+        if df is None or df.empty:
+            continue
         try:
             close = df["Close"].squeeze()
             if len(close) < sma_period + 2:
@@ -335,6 +372,20 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
                 continue
 
             if last_close <= last_sma:
+                continue
+
+            # Volume filter: last volume must be above avg of previous 14 sessions (exclude current).
+            vol_series = df.get("Volume")
+            if vol_series is None:
+                continue
+            vol_series = vol_series.squeeze()
+            if len(vol_series) < 15:
+                continue
+            last_vol = float(vol_series.iloc[-1])
+            avg_vol14 = float(vol_series.iloc[-15:-1].mean())
+            if pd.isna(last_vol) or pd.isna(avg_vol14) or avg_vol14 <= 0:
+                continue
+            if last_vol <= avg_vol14:
                 continue
 
             # Apply the pullback constraint only for the 10-SMA screener.
@@ -359,6 +410,7 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
                 "price": round(last_close, 2),
                 "sma": round(last_sma, 2),
                 "change": round(float(change), 2),
+                "vol_ratio": round(last_vol / avg_vol14, 2),
             }
             if sma_period == 10 and recent_high is not None and drawdown is not None:
                 row["recent_high"] = round(float(recent_high), 2)
@@ -373,7 +425,7 @@ def screen_sma(sma_period: int, symbols: list | None = None) -> list:
         results.sort(key=lambda x: (x.get("drawdown_pct", 0), x.get("change", 0)), reverse=True)
     else:
         results.sort(key=lambda x: x.get("change", 0), reverse=True)
-    return results
+    return results[:RESULT_LIMIT]
 
 
 def screen_rsi(oversold: bool = True, symbols: list | None = None) -> list:
@@ -386,10 +438,11 @@ def screen_rsi(oversold: bool = True, symbols: list | None = None) -> list:
     if not symbols:
         return []
 
-    raw = fetch_ohlcv_bulk(symbols, period="6mo")
     results = []
 
-    for sym, df in raw.items():
+    for sym, df in iter_ohlcv(symbols, period="6mo", interval="1d"):
+        if df is None or df.empty:
+            continue
         try:
             close      = df["Close"].squeeze()
             last_close = float(close.iloc[-1])
@@ -413,10 +466,10 @@ def screen_rsi(oversold: bool = True, symbols: list | None = None) -> list:
             logger.warning(f"RSI error {sym}: {e}")
 
     results.sort(key=lambda x: x["rsi"], reverse=not oversold)
-    return results
+    return results[:RESULT_LIMIT]
 
 
-def screen_top_movers(top_n: int = 5, gainers: bool = True) -> list:
+def screen_top_movers(top_n: int = RESULT_LIMIT, gainers: bool = True) -> list:
     """
     Fetch live NSE quotes → sort by % change → return top N.
     Falls back to yfinance OHLCV if NSE API is unavailable.
@@ -433,9 +486,10 @@ def screen_top_movers(top_n: int = 5, gainers: bool = True) -> list:
     if not symbols:
         return []
 
-    raw = fetch_ohlcv_bulk(symbols, period="5d")
     fallback = []
-    for sym, df in raw.items():
+    for sym, df in iter_ohlcv(symbols, period="5d", interval="1d"):
+        if df is None or df.empty:
+            continue
         try:
             c0 = float(df["Close"].iloc[-1])
             c1 = float(df["Close"].iloc[-2])
@@ -451,6 +505,113 @@ def screen_top_movers(top_n: int = 5, gainers: bool = True) -> list:
 
     fallback.sort(key=lambda x: x["change"], reverse=gainers)
     return fallback[:top_n]
+
+def _heap_top_n_push(heap: list, key: float, item: dict, n: int):
+    if n <= 0:
+        return
+    if len(heap) < n:
+        heapq.heappush(heap, (key, item))
+    else:
+        if key > heap[0][0]:
+            heapq.heapreplace(heap, (key, item))
+
+
+def screen_active_vol(symbols: list, universe: str) -> list:
+    """
+    Top active volume.
+    - Nifty 50: uses NSE live quotes (fast)
+    - All Stocks: uses yfinance last day volume (chunked)
+    """
+    heap = []
+
+    if universe == UNIVERSE_NIFTY50:
+        quotes = fetch_nse_live_quotes("NIFTY%2050")
+        for q in quotes:
+            try:
+                price = float(q.get("price", 0))
+                volume = float(q.get("volume", 0))
+            except (TypeError, ValueError):
+                continue
+            if not price_ok(price) or volume <= 0:
+                continue
+            traded_value = price * volume
+            item = {
+                "symbol": str(q.get("symbol", "")).strip(),
+                "price": round(price, 2),
+                "volume": int(volume),
+                "value": traded_value,
+            }
+            _heap_top_n_push(heap, volume, item, RESULT_LIMIT)
+    else:
+        for sym, df in iter_ohlcv(symbols, period="5d", interval="1d"):
+            if df is None or df.empty:
+                continue
+            try:
+                close = float(df["Close"].iloc[-1])
+                volume = float(df["Volume"].iloc[-1])
+            except Exception:
+                continue
+            if not price_ok(close) or volume <= 0:
+                continue
+            traded_value = close * volume
+            item = {
+                "symbol": sym.replace(".NS", ""),
+                "price": round(close, 2),
+                "volume": int(volume),
+                "value": traded_value,
+            }
+            _heap_top_n_push(heap, volume, item, RESULT_LIMIT)
+
+    return [it for _, it in sorted(heap, key=lambda x: x[0], reverse=True)]
+
+
+def screen_active_value(symbols: list, universe: str) -> list:
+    """
+    Top active traded value (approx): price * volume.
+    - Nifty 50: uses NSE live quotes (fast)
+    - All Stocks: uses yfinance last day close * volume (chunked)
+    """
+    heap = []
+
+    if universe == UNIVERSE_NIFTY50:
+        quotes = fetch_nse_live_quotes("NIFTY%2050")
+        for q in quotes:
+            try:
+                price = float(q.get("price", 0))
+                volume = float(q.get("volume", 0))
+            except (TypeError, ValueError):
+                continue
+            if not price_ok(price) or volume <= 0:
+                continue
+            traded_value = price * volume
+            item = {
+                "symbol": str(q.get("symbol", "")).strip(),
+                "price": round(price, 2),
+                "volume": int(volume),
+                "value": traded_value,
+            }
+            _heap_top_n_push(heap, traded_value, item, RESULT_LIMIT)
+    else:
+        for sym, df in iter_ohlcv(symbols, period="5d", interval="1d"):
+            if df is None or df.empty:
+                continue
+            try:
+                close = float(df["Close"].iloc[-1])
+                volume = float(df["Volume"].iloc[-1])
+            except Exception:
+                continue
+            if not price_ok(close) or volume <= 0:
+                continue
+            traded_value = close * volume
+            item = {
+                "symbol": sym.replace(".NS", ""),
+                "price": round(close, 2),
+                "volume": int(volume),
+                "value": traded_value,
+            }
+            _heap_top_n_push(heap, traded_value, item, RESULT_LIMIT)
+
+    return [it for _, it in sorted(heap, key=lambda x: x[0], reverse=True)]
 
 
 def screen_fundamentals(cap_type: str) -> list:
@@ -496,7 +657,7 @@ def screen_fundamentals(cap_type: str) -> list:
         except Exception as e:
             logger.warning(f"Fundamental error {sym}: {e}")
 
-    return results
+    return results[:RESULT_LIMIT]
 
 
 # ─── FORMATTERS ──────────────────────────────────────────────────────────────
@@ -513,10 +674,11 @@ def fmt_sma(results: list, period: int, universe_label: str = "Nifty 50") -> str
 
     title = f"📊 *Pullback ≥20% + Above {period}-Day SMA* — {len(results)} stocks" if period == 10 else f"📊 *Above {period}-Day SMA* — {len(results)} stocks"
     lines = [f"{title}\n"]
-    for r in results[:15]:
+    for r in results[:RESULT_LIMIT]:
         dot = "🟢" if r["change"] >= 0 else "🔴"
         dd = f"  DD `{r['drawdown_pct']:.1f}%`" if period == 10 and "drawdown_pct" in r else ""
-        lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  SMA={r['sma']}{dd}")
+        vx = f"  Vx`{r['vol_ratio']}`" if "vol_ratio" in r else ""
+        lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  SMA={r['sma']}{dd}{vx}")
     lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
     return "\n".join(lines)
 
@@ -526,7 +688,7 @@ def fmt_rsi(results: list, oversold: bool, universe_label: str = "Nifty 50") -> 
     if not results:
         return f"❌ No stocks in the {label} zone right now."
     lines = [f"*RSI Signal — {label}*\n_{len(results)} found_\n"]
-    for r in results[:15]:
+    for r in results[:RESULT_LIMIT]:
         dot = "🟢" if r["change"] >= 0 else "🔴"
         lines.append(f"{dot} *{r['symbol']}*  ₹{r['price']}  `{r['change']:+.2f}%`  RSI `{r['rsi']}`")
     lines.append(f"\n_{universe_label} · NSE Live · {ts()}_")
@@ -534,7 +696,7 @@ def fmt_rsi(results: list, oversold: bool, universe_label: str = "Nifty 50") -> 
 
 
 def fmt_movers(results: list, gainers: bool) -> str:
-    title = "🚀 Top 5 Gainers" if gainers else "📉 Top 5 Losers"
+    title = f"🚀 Top {RESULT_LIMIT} Gainers" if gainers else f"📉 Top {RESULT_LIMIT} Losers"
     if not results:
         return f"❌ Could not fetch {title} data."
     lines = [f"*{title}* — Nifty 50\n"]
@@ -545,6 +707,39 @@ def fmt_movers(results: list, gainers: bool) -> str:
     lines.append(f"\n_NSE Live · {ts()}_")
     return "\n".join(lines)
 
+def fmt_activity(results: list, kind: str, universe_label: str) -> str:
+    if kind == "value":
+        title = "🚀 Active Value"
+        key_label = "Value"
+        sort_key = "value"
+    else:
+        title = "🚀 Active Vol"
+        key_label = "Vol"
+        sort_key = "volume"
+
+    if not results:
+        return f"❌ Could not fetch {title} data."
+
+    lines = [f"*{title}* — {universe_label}\n"]
+    for i, r in enumerate(results[:RESULT_LIMIT], 1):
+        price = r.get("price", "N/A")
+        volume = r.get("volume")
+        value = r.get("value")
+
+        if isinstance(volume, (int, float)):
+            vol_txt = f"{int(volume):,}"
+        else:
+            vol_txt = "N/A"
+
+        if isinstance(value, (int, float)):
+            val_txt = f"₹{float(value):,.0f}"
+        else:
+            val_txt = "N/A"
+
+        lines.append(f"{i}. *{r.get('symbol','')}*  ₹{price}  Vol `{vol_txt}`  Val `{val_txt}`")
+    lines.append(f"\n_NSE/yfinance · {ts()}_")
+    return "\n".join(lines)
+
 
 def fmt_fundamentals(results: list, cap_type: str) -> str:
     emoji = "🔹" if cap_type == "small" else "🔷"
@@ -552,7 +747,7 @@ def fmt_fundamentals(results: list, cap_type: str) -> str:
     if not results:
         return f"❌ Could not fetch {label} data."
     lines = [f"{emoji} *{label}*\n"]
-    for r in results[:10]:
+    for r in results[:RESULT_LIMIT]:
         lines.append(
             f"*{r['symbol']}*  _{r['name']}_\n"
             f"  Sector: {r['sector']}\n"
@@ -572,7 +767,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "All data is fetched *live from NSE* — no hardcoded symbols.\n\n"
         "📊 *Technical* — SMA & RSI on live Nifty 50 constituents\n"
         "📈 *Fundamental* — Live small/mid cap snapshots\n"
-        "🚀 *Gainers* / 📉 *Losers* — Real-time NSE movers",
+        f"🚀 *Gainers* / 📉 *Losers* — Top {RESULT_LIMIT} NSE movers",
         parse_mode="Markdown",
         reply_markup=HOME_KEYBOARD,
     )
@@ -648,12 +843,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = await loop.run_in_executor(None, lambda: screen_rsi(oversold=False, symbols=symbols))
             msg  = fmt_rsi(data, oversold=False, universe_label=universe_label)
 
-        elif text == "📉 Top 5 Losers":
-            data = await loop.run_in_executor(None, lambda: screen_top_movers(5, gainers=False))
+        elif text in ("🚀 Active Val", "🚀 Actve Val"):
+            data = await loop.run_in_executor(None, lambda: screen_active_value(symbols, universe))
+            msg  = fmt_activity(data, "value", universe_label)
+
+        elif text == "🚀 Active Vol":
+            data = await loop.run_in_executor(None, lambda: screen_active_vol(symbols, universe))
+            msg  = fmt_activity(data, "vol", universe_label)
+
+        elif text == "📉 Top Losers":
+            data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=False))
             msg  = fmt_movers(data, gainers=False)
 
-        elif text == "🚀 Top 5 Gainers":
-            data = await loop.run_in_executor(None, lambda: screen_top_movers(5, gainers=True))
+        elif text == "🚀 Top Gainers":
+            data = await loop.run_in_executor(None, lambda: screen_top_movers(RESULT_LIMIT, gainers=True))
             msg  = fmt_movers(data, gainers=True)
 
         elif text == "🔹 Small Cap":
